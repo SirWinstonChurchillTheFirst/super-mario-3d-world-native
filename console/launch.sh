@@ -2,7 +2,7 @@
 # Starts a Wii U game built with the cafe runtime on the Batocera box: launch.sh <name> "<game folder>"
 #   name = folder under /userdata/ports-native/wiiu (3dworld, tennis, ...), holds cafegame, fonts/, save/
 # Called from the hidden ports script "/userdata/roms/ports/<Title> (Nativ).sh".
-# NOT RUN ON THE CONSOLE YET (19 November: prepared on the PC only).
+# First run on the console: 19 November (Super Mario 3D World).
 NAME=$1
 GAME=$2
 BASE=/userdata/ports-native/wiiu/$NAME
@@ -15,9 +15,29 @@ export SDL_JOYSTICK_HIDAPI=0 SDL_JOYSTICK_HIDAPI_WII=0
 export SDL_GAMECONTROLLERCONFIG="$(python3 /userdata/system/nova/padfix.py 2>/dev/null)"
 export TTT2_FULLSCREEN=1 CAFE_SAVE_DIR=$BASE/save
 mkdir -p "$BASE/save" /userdata/system/logs
+# Scale 1 = the Wii U's own 1280x720: the runtime's default on a 1080p screen is 2560x1440, which the console's
+# Vega 6 cannot fill (1.6 pictures a second, measured 19 November).
+export TTT2_SCALE=1
+# After this game is ended with the hotkey (Alt+F4 from Batocera's virtual "batocera hotkeys" keyboard), the display
+# server keeps Alt and F4 as held down on that keyboard, and every game started afterwards closes after 3 s
+# (seen 19 November, three times; why the release is lost is NOT found). Until it is: a held key on that
+# keyboard is released by switching the device off and on, before the start and after the end, with a log line.
+LOG=/userdata/system/logs/native-wiiu-$NAME.log
+fix_keys() {
+  for id in $(xinput list --id-only 2>/dev/null); do
+    [ "$(xinput list --name-only $id 2>/dev/null)" = "batocera hotkeys" ] || continue
+    if xinput query-state $id 2>/dev/null | grep -q '=down'; then
+      xinput disable $id; sleep 0.3; xinput enable $id
+      echo "launch.sh: keys were held down on 'batocera hotkeys' ($1): released" >> "$LOG.keys"
+    fi
+  done
+}
+fix_keys "before the start"
 # Extra switches for one test run (the file is gone after a restart): e.g. "export CAFE_SAVE_DIR=$BASE/save-test"
 [ -f /tmp/wiiutest.env ] && . /tmp/wiiutest.env
-./cafegame "$GAME" > /userdata/system/logs/native-wiiu-$NAME.log 2>&1 &
+./cafegame "$GAME" > "$LOG" 2>&1 &
 game=$!
 trap 'kill $game 2>/dev/null; sleep 3; kill -9 $game 2>/dev/null' TERM INT HUP
 wait $game
+sleep 1
+fix_keys "after the end"

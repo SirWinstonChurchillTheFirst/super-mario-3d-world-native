@@ -7,7 +7,7 @@ translated to C++ ahead of time and runs on a reimplementation of the Wii U's sy
 > unpacked to `code/`, `content/`, `meta/`. The translated C++ and the program built from it contain the game's
 > code: do not share them. Not affiliated with or endorsed by Nintendo.
 
-## Status (19 November 2026, later): World 1-1 is played by script, still little tested
+## Status (19 November 2026, morning): World 1-1 is played by script on the PC; on the console it runs at half speed
 
 Tested on one PC (Windows 11, GeForce RTX 3070 Ti, 1280x720), with scripted button presses only.
 
@@ -23,7 +23,7 @@ Tested on one PC (Windows 11, GeForce RTX 3070 Ti, 1280x720), with scripted butt
 | Speed | 59 to 60 frames/s without picture captures (title and opening measured that way), single late pictures of 15 to 70 ms at scene changes; the renderer needs 1.5 to 4 ms per frame on that card. Each picture capture of the test tools costs about 0.1 s, so captured runs show 56 to 58 |
 | Saving and loading | **not tested**: the game saves when a level is finished, and the script does not finish one |
 | Controller, GamePad screen, everything after World 1-1 | **not tested** |
-| Linux program for a small AMD box (Batocera) | built, package and install script in `console/`; **never run there** |
+| Linux program on a small AMD box (Batocera, Ryzen 3 PRO 4350GE, Vega 6, 1080p TV) | **runs, at half speed**: installed with `console/deploy.sh`, started through the menu; title 60 frames/s, from the file select on a steady 30 (the game then runs in slow motion). Opening scene and world map look right there. Measured: the game's own threads need about 10 % of one core; per frame the renderer's command thread needs about 6 ms, its retirement thread 8.5 ms and the graphics chip 7 ms, which together miss one 60 Hz refresh. Not solved. Two things had to be fixed first: the runtime renders at 2560x1440 by default on a 1080p screen (1.6 frames/s; `TTT2_SCALE=1` is set by `console/launch.sh` now), and translated shaders zeroed their registers in a loop that Mesa does not unroll (4.6 frames/s; `port/patch_night4.py`). After the game is ended with the hotkey, Alt+F4 stays "held" on Batocera's virtual hotkey keyboard and the next game closes after 3 s; `launch.sh` releases it before and after a run, the cause is not found |
 
 Known gaps: Mii data files of the console (`FFLRes*.dat`) are not part of a game dump and are missing; occlusion
 queries are not run (conditional draws are always drawn); Miiverse and online services answer "offline".

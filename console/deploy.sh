@@ -1,6 +1,6 @@
 #!/bin/bash
-# Puts one Wii U port on the console. NOT RUN YET (19 November: the console was busy with another job).
-#   bash console/deploy.sh 3dworld "Super Mario 3D World" "Super Mario 3D World" code/RedCarpet.rpx root@console
+# Puts one Wii U port on the console (first run: 19 November, Super Mario 3D World).
+#   bash console/deploy.sh 3dworld "Super Mario 3D World" "Super Mario 3D World" code/RedCarpet.rpx [host]
 #     $1 name (WSL build ~/wiiu/build-$1/cafegame)   $2 title for the menu
 #     $3 game folder under /userdata/roms/wiiu        $4 the game's entry in the Wii U list (rom path below the folder)
 # - refuses while a game runs there (Nova Home does not count)
@@ -11,8 +11,8 @@
 # After it: start the ports script once through the menu's interface and LOOK at the picture
 #   curl -s -X POST localhost:1234/launch -d "/userdata/roms/ports/<Title> (Nativ).sh"
 set -e
-N=$1; TITLE=$2; FOLDER=$3; ROM=$4; H=${5:?give the console as user@host}
-P=$(cd "$(dirname "$0")/.." && pwd)
+N=$1; TITLE=$2; FOLDER=$3; ROM=$4; H=${5:-root@192.168.178.107}
+P=/d/retro/wiiurecomp
 OUT=$P/console/out/$N; mkdir -p "$OUT"
 running=$(ssh -o ConnectTimeout=10 $H 'curl -s -m 3 localhost:1234/runningGame' 2>/dev/null)
 echo "$running" | grep -q "NO GAME RUNNING\|\"name\": \"Nova Home\"" || { echo "stop: a game is running on the console"; exit 1; }
@@ -30,6 +30,10 @@ push() {  # push <local file> <path on the console>
 wsl -e bash -lc "strip -o /mnt/d/retro/wiiurecomp/console/out/$N/cafegame ~/wiiu/build-$N/cafegame && cp ~/wiiu/build-$N/fonts/CafeStd.ttf /mnt/d/retro/wiiurecomp/console/out/$N/CafeStd.ttf"
 B=/userdata/ports-native/wiiu
 ssh $H "mkdir -p $B/$N/fonts $B/$N/save $B/lib; [ -f $B/$N/cafegame ] && cp -p $B/$N/cafegame $B/$N/cafegame.vor-\$(date +%Y%m%d-%H%M); true" 2>/dev/null
+# Game data on the SSD: /userdata/roms is a merged view of the hard disk without a page cache there,
+# every read costs 8-40 ms (found by the 3DS work, 19 November). Copied on the console itself, once.
+echo "== game data to the SSD"
+ssh $H "[ -f $B/$N/game/.komplett ] || { rm -rf $B/$N/game.neu && cp -a \"/userdata/roms/wiiu/$FOLDER\" $B/$N/game.neu && rm -rf $B/$N/game && mv $B/$N/game.neu $B/$N/game && touch $B/$N/game/.komplett; }; du -sh $B/$N/game | cut -f1" 2>/dev/null
 echo "== program"; push "$OUT/cafegame" $B/$N/cafegame; ssh $H "chmod +x $B/$N/cafegame" 2>/dev/null
 scp -q "$OUT/CafeStd.ttf" "$H:$B/$N/fonts/CafeStd.ttf" 2>/dev/null     # free stand-in font (DejaVu Sans), not Nintendo's
 scp -q "$P/console/launch.sh" "$H:$B/launch.sh" 2>/dev/null; ssh $H "chmod +x $B/launch.sh" 2>/dev/null
@@ -38,7 +42,7 @@ S="$OUT/$TITLE (Nativ).sh"
 cat > "$S" <<EOF
 #!/bin/bash
 # Nativer Port (Wii U, ohne Emulator): $TITLE
-exec /userdata/ports-native/wiiu/launch.sh $N "/userdata/roms/wiiu/$FOLDER"
+exec /userdata/ports-native/wiiu/launch.sh $N "/userdata/ports-native/wiiu/$N/game"
 EOF
 cat > "$OUT/native-games.add.json" <<EOF
 [{"rom": "/userdata/roms/wiiu/$FOLDER/$ROM", "title": "$TITLE",
