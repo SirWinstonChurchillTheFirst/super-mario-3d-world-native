@@ -331,6 +331,106 @@ index 7c1b5ee..e90ac00 100644
  void set_swap_interval(uint32_t interval);
  uint32_t swap_interval();
  
+diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
+index d591259..e098523 100644
+--- a/runtime/src/gpu/vulkan/draw.cpp
++++ b/runtime/src/gpu/vulkan/draw.cpp
+@@ -740,6 +740,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     case 0x05: case 0x15: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
+     case 0x06: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+     case 0x13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuads; break;
++    case 0x11: // rectangle list: the vertex shader makes the fourth corner (port/patch_rects.py)
++        // (with an index buffer: port/patch_rects2.py, the shader reads the indices)
++        topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++        break;
+     case 0x14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuadStrip; break;
+     default:
+         report_once("unsupported primitive type", r(reg::VGT_PRIMITIVE_TYPE));
+@@ -965,7 +969,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     if (replaying_) replace_constants(draw_index, dc);
+     const VkDeviceSize ubo_align = std::max<VkDeviceSize>(ctx_.properties.limits.minUniformBufferOffsetAlignment, 16);
+     VkDeviceSize dc_offset = 0;
+-    std::memcpy(upload(sizeof(dc), ubo_align, dc_offset), &dc, sizeof(dc));
++    uint8_t* const dc_uploaded = reinterpret_cast<uint8_t*>(upload(sizeof(dc), ubo_align, dc_offset));
++    std::memcpy(dc_uploaded, &dc, sizeof(dc));
+     VkDeviceSize reg_offset[2] = {};
+     if (vs->info.uses_registers) {
+         std::memcpy(upload(4096, ubo_align, reg_offset[0]), &regs.value[reg::SQ_ALU_CONSTANT0_256 >> 2], 4096);
+@@ -1069,6 +1074,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+         }
+     }
+ 
++    if (r(reg::VGT_PRIMITIVE_TYPE) == 0x11 && indexed) {
++        // A rectangle list with indices: the vertex shader reads them (it makes the fourth corner itself).
++        if (stream_out) report_once("rectangle list with stream-out: the indices take its fourth buffer", d.count);
++        const VkDeviceAddress at = ring_.address() + index_offset;
++        const abi::Buffer where{static_cast<uint32_t>(at), static_cast<uint32_t>(at >> 32), index_count * 4, 4};
++        std::memcpy(dc_uploaded + (reinterpret_cast<const uint8_t*>(&dc.so[3]) - reinterpret_cast<const uint8_t*>(&dc)),
++                    &where, sizeof(where));
++        indexed = false;
++    }
++
+     // Stream-out data a run of stream-out draws wrote, read by the draws
+     // after it (skinned vertices, text): a barrier first, outside the pass.
+     const bool writes_stream_out = stream_out && !replaying_;
+@@ -1186,7 +1201,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     }
+     viewport.minDepth = std::clamp(viewport.minDepth, 0.0f, 1.0f);
+     viewport.maxDepth = std::clamp(viewport.maxDepth, 0.0f, 1.0f);
+-    if ((r(reg::PA_CL_VTE_CNTL) & 0x3F) != 0x3F) report_once("viewport transform partly disabled", r(reg::PA_CL_VTE_CNTL));
++    if ((r(reg::PA_CL_VTE_CNTL) & 0x3F) == 0 && std::getenv("TTT2_VTE_OFF_AS_BEFORE") == nullptr) {
++        // port/patch_vte_off.py: vertices are window pixels; the identity viewport passes them through.
++        viewport = {-vscale, -vscale, 2.0f * vscale, 2.0f * vscale, 0.0f, 1.0f};
++    } else if ((r(reg::PA_CL_VTE_CNTL) & 0x3F) != 0x3F) {
++        report_once("viewport transform partly disabled", r(reg::PA_CL_VTE_CNTL));
++    }
+     vkCmdSetViewport(c, 0, 1, &viewport);
+     const uint32_t tl = r(reg::PA_SC_GENERIC_SCISSOR_TL), br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4);
+     const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
+@@ -1325,7 +1345,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+         vkCmdBindIndexBuffer(c, ring_.buffer(), index_offset, VK_INDEX_TYPE_UINT32);
+         vkCmdDrawIndexed(c, index_count, instances, 0, 0, 0);
+     } else {
+-        vkCmdDraw(c, d.count, instances, 0, 0);
++        vkCmdDraw(c, r(reg::VGT_PRIMITIVE_TYPE) == 0x11 ? d.count / 3 * 6 : d.count, instances, 0, 0);
+     }
+     if (writes_stream_out) stream_out_pending_ = true;
+     // TTT2_TRACE_DRAWS=first,last: the traced frame's color target after each of those draws (from 1), as PNGs.
+diff --git a/runtime/src/gpu/vulkan/formats.cpp b/runtime/src/gpu/vulkan/formats.cpp
+index 9911027..86300a5 100644
+--- a/runtime/src/gpu/vulkan/formats.cpp
++++ b/runtime/src/gpu/vulkan/formats.cpp
+@@ -38,7 +38,9 @@ VkFormat by_type(uint32_t type, VkFormat unorm, VkFormat uint, VkFormat snorm, V
+ void init_formats(VkPhysicalDevice physical) {
+     const VkFormatFeatureFlags sampled = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+     g_a4b4g4r4 = supported(physical, VK_FORMAT_A4B4G4R4_UNORM_PACK16, sampled);
+-    g_a1b5g5r5 = supported(physical, VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR, sampled);
++    // Needs VK_KHR_maintenance5 enabled, which the runtime does not do (port/patch_target_remake.py): the
++    // A1R5G5B5 path with swapped channels is used on every device.
++    g_a1b5g5r5 = false;
+     g_rgba16_snorm = supported(physical, VK_FORMAT_R16G16B16A16_SNORM,
+                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+                                    VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+diff --git a/runtime/src/gpu/vulkan/targets.cpp b/runtime/src/gpu/vulkan/targets.cpp
+index 5bd50e6..3aa10a3 100644
+--- a/runtime/src/gpu/vulkan/targets.cpp
++++ b/runtime/src/gpu/vulkan/targets.cpp
+@@ -181,8 +181,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
+     barrier();
+     VkImageBlit blit{};
+     blit.srcSubresource = blit.dstSubresource = {old.aspect, 0, 0, 1};
+-    blit.srcOffsets[1] = {static_cast<int32_t>(old.width), static_cast<int32_t>(old.height), 1};
+-    blit.dstOffsets[1] = {static_cast<int32_t>(old.width * scale / t.scale), static_cast<int32_t>(old.height * scale / t.scale), 1};
++    // Only what both images hold (port/patch_target_remake.py): the new one may be the smaller.
++    const float remake_ratio = scale / t.scale;
++    const uint32_t copy_w = std::min(old.width, static_cast<uint32_t>(t.image.width / remake_ratio));
++    const uint32_t copy_h = std::min(old.height, static_cast<uint32_t>(t.image.height / remake_ratio));
++    blit.srcOffsets[1] = {static_cast<int32_t>(copy_w), static_cast<int32_t>(copy_h), 1};
++    blit.dstOffsets[1] = {static_cast<int32_t>(std::min<uint32_t>(static_cast<uint32_t>(copy_w * remake_ratio), t.image.width)),
++                          static_cast<int32_t>(std::min<uint32_t>(static_cast<uint32_t>(copy_h * remake_ratio), t.image.height)), 1};
+     vkCmdBlitImage(cmd(), old.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                    t.depth || scale == t.scale ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
+     barrier();
 diff --git a/runtime/src/gx2/cbpool.cpp b/runtime/src/gx2/cbpool.cpp
 index 09327e6..699483d 100644
 --- a/runtime/src/gx2/cbpool.cpp
@@ -472,11 +572,37 @@ index e403aff..4cde864 100644
  CAFE_EXPORT(gx2, GX2ResolveAAColorBuffer, GX2ResolveAAColorBuffer);
  CAFE_EXPORT(gx2, GX2ExpandDepthBuffer, GX2ExpandDepthBuffer);
  CAFE_EXPORT(gx2, GX2ConvertDepthBufferToTextureSurface, GX2ConvertDepthBufferToTextureSurface);
+diff --git a/runtime/src/latte/environment.cpp b/runtime/src/latte/environment.cpp
+index 6988565..5a368aa 100644
+--- a/runtime/src/latte/environment.cpp
++++ b/runtime/src/latte/environment.cpp
+@@ -48,6 +48,7 @@ void build_environment(const uint32_t* regs, Stage stage, ShaderEnvironment& env
+         env.clip_space_dx = zoffset - zscale < -1e-6f || zoffset + zscale > 1.0f + 1e-6f;
+     }
+     env.point_size_export = (r(reg::PA_CL_VS_OUT_CNTL) >> 24) & 1;
++    env.rects = r(reg::VGT_PRIMITIVE_TYPE) == 0x11;
+     if (r(reg::VGT_STRMOUT_EN) & 1) {
+         env.stream_out_mask = static_cast<uint8_t>(r(reg::VGT_STRMOUT_BUFFER_EN) & 0xF);
+         for (int i = 0; i < 4; ++i) {
+@@ -118,7 +119,7 @@ uint64_t environment_key(const ShaderEnvironment& env) {
+     }
+     if (env.stage == Stage::kVertex) {
+         for (uint8_t s : env.vtx_semantic) h.add(s);
+-        h.add(env.clip_space_dx | (env.point_size_export << 1) | (env.stream_out_mask << 2));
++        h.add(env.clip_space_dx | (env.point_size_export << 1) | (env.stream_out_mask << 2) | (env.rects << 6));
+         for (uint16_t s : env.stream_out_stride) h.add(s);
+     } else {
+         h.add(env.ps_front_face | (env.ps_front_face_all_bits << 1) | (env.ps_front_face_gpr << 2) |
 diff --git a/runtime/src/latte/translate.cpp b/runtime/src/latte/translate.cpp
-index 1e9f5d4..2de0942 100644
+index 1e9f5d4..0809dd1 100644
 --- a/runtime/src/latte/translate.cpp
 +++ b/runtime/src/latte/translate.cpp
-@@ -584,6 +584,10 @@ std::string Translator::fetch_value(const std::string& buffer, const std::string
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "latte/translate.h"
+ 
+ #include "latte/shader_abi.h"
+@@ -584,8 +585,16 @@ std::string Translator::fetch_value(const std::string& buffer, const std::string
      case 0x0F: c = "uvec4(w.x & 0xFFFFu, w.x >> 16, 0u, 0u)"; bits = 16; comps = 2; break;
      case 0x10: c = "uvec4(floatBitsToUint(unpackHalf2x16(w.x)), 0u, 0u)"; is_float = true; comps = 2; break;
      case 0x1A: c = "uvec4(w.x & 0xFFu, (w.x >> 8) & 0xFFu, (w.x >> 16) & 0xFFu, w.x >> 24)"; bits = 8; break;
@@ -486,8 +612,14 @@ index 1e9f5d4..2de0942 100644
 +        break;
      case 0x1B: // 10_10_10_2: the 2-bit W is normalized/converted with 2 bits
          c = "uvec4(w.x & 0x3FFu, (w.x >> 10) & 0x3FFu, (w.x >> 20) & 0x3FFu, w.x >> 30)";
++        // port/patch_fetch_1010102_order.py (experiment): converted values with X in the top bits
++        if (num_format != 1 && std::getenv("TTT2_1010102_HIGH") != nullptr) {
++            c = "uvec4(w.x >> 22, (w.x >> 12) & 0x3FFu, (w.x >> 2) & 0x3FFu, w.x & 3u)";
++        }
          bits = 10;
-@@ -603,8 +607,14 @@ std::string Translator::fetch_value(const std::string& buffer, const std::string
+         break;
+     case 0x1D: c = "uvec4(w.x, w.y, 0u, 0u)"; comps = 2; break;
+@@ -603,8 +612,14 @@ std::string Translator::fetch_value(const std::string& buffer, const std::string
          fail(format("unsupported fetch data format 0x%X", data_format));
          return "ivec4(0)";
      }
@@ -504,6 +636,74 @@ index 1e9f5d4..2de0942 100644
      }
      std::string value;
      if (is_float || raw32 || (bits == 32 && num_format != 2)) {
+@@ -1417,7 +1432,8 @@ bool Translator::run(std::string& error) {
+     indent_ = 1;
+     // Inputs.
+     if (vs_) {
+-        line("R[0] = ivec4(gl_VertexIndex, 0, 0, gl_InstanceIndex);");
++        line(env_.rects ? "R[0] = ivec4(rect_vertex, 0, 0, gl_InstanceIndex);"
++                        : "R[0] = ivec4(gl_VertexIndex, 0, 0, gl_InstanceIndex);");
+         line("gl_PointSize = dc.params.y;"); // PA_SU_POINT_SIZE unless the shader exports a size
+         for (int k = 0; k < env_.ps_input_count; ++k) {
+             bool exported = false;
+@@ -1497,7 +1513,44 @@ bool Translator::run(std::string& error) {
+         store += "    }\n}\n";
+         globals += load + store;
+     }
+-    out_.glsl = header() + globals + "\n" + functions + "void main() {\n" + init + main_vars + main_body + "}\n";
++    if (vs_ && env_.rects) {
++        // A rectangle list (port/patch_rects.py): 6 shader vertices per rectangle. 0-2 are the title's three;
++        // 3-5 are the second triangle: the two ends of the longest edge and the corner the console adds.
++        std::vector<int> outs;
++        for (int k = 0; k < env_.ps_input_count; ++k) {
++            if (k == env_.ps_position_input) continue;
++            bool exported = false;
++            for (uint8_t s : env_.vs_out_semantic) exported |= s == env_.ps_inputs[k].semantic && s != 0xFF;
++            if (exported) outs.push_back(k);
++        }
++        std::string m = "int rect_vertex;\n"
++                        "int rect_index(int i) { return dc.so[3].z != 0u ? int(gload(dc.so[3], uint(i) * 4u, 4u)) : i; }\n"
++                        "void rect_body() {\n" + init + main_vars + main_body + "}\n";
++        m += "void main() {\n    int rq = gl_VertexIndex / 6, rj = gl_VertexIndex % 6;\n";
++        m += "    if (rj < 3) { rect_vertex = rect_index(rq * 3 + rj); rect_body(); return; }\n";
++        m += "    vec4 rp[3];\n";
++        for (int k : outs) m += format("    vec4 rv%d[3];\n", k);
++        m += "    for (int i = 0; i < 3; ++i) {\n        rect_vertex = rect_index(rq * 3 + i);\n        rect_body();\n        rp[i] = gl_Position;\n";
++        for (int k : outs) m += format("        rv%d[i] = v%d;\n", k, k);
++        m += "    }\n";
++        m += "    vec2 ra = rp[0].xy / rp[0].w, rb = rp[1].xy / rp[1].w, rc = rp[2].xy / rp[2].w;\n";
++        m += "    float d01 = dot(ra - rb, ra - rb), d12 = dot(rb - rc, rb - rc), d20 = dot(rc - ra, rc - ra);\n";
++        m += "    int rr = (d01 >= d12 && d01 >= d20) ? 2 : (d12 >= d20 ? 0 : 1);\n";
++        m += "    int rA = (rr + 1) % 3, rB = (rr + 2) % 3;\n";
++        m += "    if (rj == 3) {\n        gl_Position = rp[rA];\n";
++        for (int k : outs) m += format("        v%d = rv%d[rA];\n", k, k);
++        m += "    } else if (rj == 5) {\n        gl_Position = rp[rB];\n";
++        for (int k : outs) m += format("        v%d = rv%d[rB];\n", k, k);
++        m += "    } else {\n        gl_Position = rp[rA] + rp[rB] - rp[rr];\n";
++        for (int k : outs) {
++            m += env_.ps_inputs[k].flat ? format("        v%d = rv%d[rr];\n", k, k)
++                                        : format("        v%d = rv%d[rA] + rv%d[rB] - rv%d[rr];\n", k, k, k, k);
++        }
++        m += "    }\n}\n";
++        out_.glsl = header() + globals + "\n" + functions + m;
++    } else {
++        out_.glsl = header() + globals + "\n" + functions + "void main() {\n" + init + main_vars + main_body + "}\n";
++    }
+     if (!error_.empty()) {
+         error = error_;
+         return false;
+diff --git a/runtime/src/latte/translate.h b/runtime/src/latte/translate.h
+index e8d1b9e..f7b6819 100644
+--- a/runtime/src/latte/translate.h
++++ b/runtime/src/latte/translate.h
+@@ -46,6 +46,7 @@ struct ShaderEnvironment {
+     // SPI_VS_OUT_ID: semantic id of parameter export n; 0xFF unused.
+     uint8_t vs_out_semantic[32];
+     bool clip_space_dx = false;   // PA_CL_CLIP_CNTL.DX_CLIP_SPACE_DEF: z in [0, w]
++    bool rects = false;           // VGT_PRIMITIVE_TYPE 0x11: the shader makes each rectangle's fourth corner
+     bool point_size_export = false; // PA_CL_VS_OUT_CNTL.USE_VTX_POINT_SIZE
+     uint8_t stream_out_mask = 0;    // buffers with stream-out writes enabled
+     uint16_t stream_out_stride[4] = {}; // bytes per vertex
 diff --git a/runtime/src/os/ax.cpp b/runtime/src/os/ax.cpp
 index efe3675..457b6ff 100644
 --- a/runtime/src/os/ax.cpp
@@ -691,6 +891,28 @@ index efe3675..457b6ff 100644
  CAFE_EXPORT(snd_core, AXInit, AXInit);
  CAFE_EXPORT(snd_core, AXQuit, AXQuit);
  CAFE_EXPORT(snd_core, AXIsInit, AXIsInit);
+diff --git a/runtime/src/os/coreinit_misc.cpp b/runtime/src/os/coreinit_misc.cpp
+index 50b2c1e..0faaa54 100644
+--- a/runtime/src/os/coreinit_misc.cpp
++++ b/runtime/src/os/coreinit_misc.cpp
+@@ -2,6 +2,7 @@
+ // GHS C runtime hooks, console output and process exit.
+ 
+ #include "guest_format.h"
++#include "gpu/gpu.h"
+ #include "kernel.h"
+ 
+ #include "cafe/export.h"
+@@ -83,7 +84,8 @@ GuestAddress guest_memset(GuestAddress dst, int32_t value, uint32_t size) {
+ 
+ // The host's caches are coherent with everything the runtime does, so cache
+ // maintenance has no effect; zeroing still has to happen.
+-void DCFlushRange(uint32_t, uint32_t) {}
++// port/patch_dcflush.py: a flush makes CPU writes visible to the GPU; textures over the range are re-checked.
++void DCFlushRange(uint32_t address, uint32_t size) { gpu::cpu_wrote(address, size); }
+ void DCInvalidateRange(uint32_t, uint32_t) {}
+ void DCZeroRange(GuestAddress address, uint32_t size) {
+     const uint32_t begin = address.value & ~31u;
 diff --git a/runtime/src/os/fs.cpp b/runtime/src/os/fs.cpp
 index 404cc34..99fdabc 100644
 --- a/runtime/src/os/fs.cpp

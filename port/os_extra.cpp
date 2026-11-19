@@ -7,11 +7,14 @@
 #include "cafe/runtime.h"
 #include "cafe/sysmem.h"
 #include "os/kernel.h"
+#include "gpu/gpu.h"
 
+#include <map>
 #include <zlib.h>
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -335,7 +338,162 @@ int32_t fs_change_dir(GuestAddress, GuestAddress, const char* path, uint32_t) {
     return 0;
 }
 
+void dc_store_range(uint32_t address, uint32_t size) { cafe::gpu::cpu_wrote(address, size); } // as DCFlushRange (patch_dcflush.py)
 void get_stack_pointer(PPCContext& ctx) { ctx.r[3] = ctx.r[1]; }
+
+// Block heaps (MEMInitBlockHeap ...: Super Mario Bros. The Lost Levels' Virtual Console shell, Super Mario 3D World
+// imports them). First fit over a list of free ranges kept on the host side; the handle is the title's heap record.
+struct BlockHeap {
+    std::map<uint32_t, uint32_t> free;  // start -> size
+    std::map<uint32_t, uint32_t> used;  // start -> size
+};
+std::mutex g_block_mutex;
+std::unordered_map<uint32_t, BlockHeap> g_block_heaps;
+BlockHeap& block_heap(uint32_t handle) {
+    const auto it = g_block_heaps.find(handle);
+    if (it == g_block_heaps.end()) fatal("port: 0x%08X is not a block heap", handle);
+    return it->second;
+}
+uint32_t block_init(uint32_t record, uint32_t start, uint32_t end, uint32_t, uint32_t, uint32_t) {
+    if (record == 0 || end <= start) return 0;
+    std::lock_guard lock(g_block_mutex);
+    BlockHeap heap;
+    heap.free[start] = end - start;
+    g_block_heaps[record] = std::move(heap);
+    *guest<be<uint32_t>>(record) = 0x424C4B48; // "BLKH"
+    return record;
+}
+uint32_t block_alloc(uint32_t handle, uint32_t size, int32_t alignment) {
+    std::lock_guard lock(g_block_mutex);
+    BlockHeap& heap = block_heap(handle);
+    if (size == 0) size = 1;
+    const bool from_end = alignment < 0;
+    uint32_t a = static_cast<uint32_t>(from_end ? -alignment : alignment);
+    if (a < 4) a = 4;
+    size = (size + 3) & ~3u;
+    const auto take = [&](std::map<uint32_t, uint32_t>::iterator it, uint32_t at) {
+        const uint32_t start = it->first, length = it->second;
+        heap.free.erase(it);
+        if (at > start) heap.free[start] = at - start;
+        if (at + size < start + length) heap.free[at + size] = start + length - (at + size);
+        heap.used[at] = size;
+        return at;
+    };
+    if (!from_end) {
+        for (auto it = heap.free.begin(); it != heap.free.end(); ++it) {
+            const uint32_t at = (it->first + a - 1) & ~(a - 1);
+            if (at >= it->first && at + size <= it->first + it->second) return take(it, at);
+        }
+    } else {
+        for (auto it = heap.free.end(); it != heap.free.begin();) {
+            --it;
+            if (it->second < size) continue;
+            const uint32_t at = (it->first + it->second - size) & ~(a - 1);
+            if (at >= it->first) return take(it, at);
+        }
+    }
+    return 0;
+}
+void block_free(uint32_t handle, uint32_t address) {
+    if (address == 0) return;
+    std::lock_guard lock(g_block_mutex);
+    BlockHeap& heap = block_heap(handle);
+    const auto it = heap.used.find(address);
+    if (it == heap.used.end()) fatal("port: MEMFreeToBlockHeap: 0x%08X was not allocated from heap 0x%08X", address, handle);
+    uint32_t start = it->first, size = it->second;
+    heap.used.erase(it);
+    auto next = heap.free.lower_bound(start);
+    if (next != heap.free.end() && start + size == next->first) {
+        size += next->second;
+        next = heap.free.erase(next);
+    }
+    if (next != heap.free.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == start) {
+            prev->second += size;
+            return;
+        }
+    }
+    heap.free[start] = size;
+}
+uint32_t block_destroy(uint32_t handle) {
+    std::lock_guard lock(g_block_mutex);
+    g_block_heaps.erase(handle);
+    return handle;
+}
+uint32_t block_total_free(uint32_t handle) {
+    std::lock_guard lock(g_block_mutex);
+    uint32_t total = 0;
+    for (const auto& [start, size] : block_heap(handle).free) total += size;
+    return total;
+}
+uint32_t block_largest_free(uint32_t handle, int32_t) {
+    std::lock_guard lock(g_block_mutex);
+    uint32_t best = 0;
+    for (const auto& [start, size] : block_heap(handle).free) best = std::max(best, size);
+    return best;
+}
+// OSDynLoad_GetLoaderHeapStatistics (Super Mario Maker prints it at start): nothing is loaded at run time here, so the
+// loader's heaps are reported as unused with room to spare.
+uint32_t loader_heap_statistics(uint32_t stats) {
+    if (stats == 0) return 0xBAD10001u;
+    const uint32_t values[6] = {0, 0, 8u << 20, 8u << 20, 0, 0}; // code used, -, code free, code largest free, data used, -
+    for (int i = 0; i < 6; ++i) *guest<be<uint32_t>>(stats + i * 4) = values[i];
+    return 0;
+}
+// OSSetExceptionCallback(Ex): the title's own handler for CPU exceptions (crash screens). The runtime stops with its
+// own report on a guest fault and never calls it; said once. Returns "no previous handler".
+uint32_t set_exception_callback(uint32_t, uint32_t, uint32_t) {
+    static std::atomic<bool> said{false};
+    once(said, "OSSetExceptionCallback: the title's exception handler is kept but never called");
+    return 0;
+}
+// GX2GetLastFrame(target, texture): the picture shown last, as a texture (Super Mario Maker asks at start). The
+// runtime's scan buffer description is used (as GX2GetCurrentScanBuffer gives it); like there, the displayed frame is
+// not written back to guest memory, so the texture's contents are not the real picture. Said once.
+void get_last_frame(PPCContext& ctx) {
+    static std::atomic<bool> said{false};
+    once(said, "GX2GetLastFrame: describes the scan buffer; its pixels are not the shown picture");
+    const uint32_t texture = ctx.r[4];
+    if (texture == 0) return;
+    forward(ctx, "gx2", "GX2GetCurrentScanBuffer"); // fills the surface part (a colour buffer and a texture begin alike)
+    const uint32_t view[5] = {0, 1, 0, 1, 0x00010203};  // first mip, mips, first slice, slices, component map
+    for (int i = 0; i < 5; ++i) *guest<be<uint32_t>>(texture + 0x74 + i * 4) = view[i];
+    ctx.r[3] = texture;
+    forward(ctx, "gx2", "GX2InitTextureRegs");
+}
+// GX2PatchDisplayList(list, type, byte offset, shader): replaces the "set shader" commands a display list holds at that
+// offset by the ones for another shader (Super Mario Maker). Done by letting the runtime's own GX2Set...Shader write
+// its commands there again, through a display list opened at that place. Types as in decaf's GX2PatchShaderType
+// (1 fetch, 2 vertex, 3 vertex before geometry, 4 geometry, 5 pixel), NOT checked on a console. Assumes the title is
+// not in the middle of building another display list on this thread; said once.
+void patch_display_list(PPCContext& ctx) {
+    static std::atomic<bool> said{false};
+    once(said, "GX2PatchDisplayList: the shader commands are written again in place (unverified)");
+    const uint32_t list = ctx.r[3], type = ctx.r[4], offset = ctx.r[5], shader = ctx.r[6];
+    const char* setter = type == 1 ? "GX2SetFetchShader" : type == 2 || type == 3 ? "GX2SetVertexShader"
+                         : type == 4 ? "GX2SetGeometryShader" : type == 5 ? "GX2SetPixelShader" : nullptr;
+    static std::atomic<int> shown{0};
+    if (std::getenv("PORT_TRACE_PATCH") && shown.fetch_add(1) < 12) {
+        std::fprintf(stderr, "port: GX2PatchDisplayList(list 0x%08X, type %u, offset 0x%X, shader 0x%08X): shader words", list, type, offset, shader);
+        for (int i = 0; shader != 0 && i < 8; ++i) std::fprintf(stderr, " %08X", static_cast<uint32_t>(*guest<be<uint32_t>>(shader + i * 4)));
+        std::fputc(10, stderr);
+    }
+    if (setter == nullptr || list == 0 || shader == 0) fatal("port: GX2PatchDisplayList: type %u, list 0x%08X, shader 0x%08X", type, list, shader);
+    ctx.r[3] = list + offset;
+    ctx.r[4] = 0x400;
+    ctx.r[5] = 0;
+    forward(ctx, "gx2", "GX2BeginDisplayListEx");
+    ctx.r[3] = shader;
+    forward(ctx, "gx2", setter);
+    ctx.r[3] = list + offset;
+    forward(ctx, "gx2", "GX2EndDisplayList");
+}
+// GX2CopyDisplayList(list, bytes): the list's commands are put into the current command buffer; the runtime's
+// GX2CallDisplayList has the same effect on what is drawn.
+void copy_display_list(PPCContext& ctx) { forward(ctx, "gx2", "GX2CallDisplayList"); }
+uint32_t block_tracking_left(uint32_t) { return 0x10000; } // the host-side lists do not run out
+uint32_t block_add_tracking(uint32_t, uint32_t, uint32_t) { return 0; }
 
 // Unit heaps (blocks of one size). The records live on the host side; the handle is the heap's start address.
 struct UnitHeap {
@@ -548,6 +706,20 @@ CAFE_EXPORT(coreinit, MPStartTaskQ, mp_start_queue);
 CAFE_EXPORT(coreinit, MPStopTaskQ, mp_stop_queue);
 CAFE_EXPORT(coreinit, MPResetTaskQ, mp_reset_queue);
 CAFE_EXPORT(coreinit, MPRunTasksFromTaskQ, mp_run_tasks);
+CAFE_EXPORT(coreinit, OSDynLoad_GetLoaderHeapStatistics, loader_heap_statistics);
+CAFE_EXPORT(coreinit, OSSetExceptionCallbackEx, set_exception_callback);
+CAFE_EXPORT(coreinit, OSSetExceptionCallback, set_exception_callback);
+CAFE_EXPORT(gx2, GX2GetLastFrame, get_last_frame);
+CAFE_EXPORT(gx2, GX2PatchDisplayList, patch_display_list);
+CAFE_EXPORT(gx2, GX2CopyDisplayList, copy_display_list);
+CAFE_EXPORT(coreinit, MEMInitBlockHeap, block_init);
+CAFE_EXPORT(coreinit, MEMAllocFromBlockHeapEx, block_alloc);
+CAFE_EXPORT(coreinit, MEMFreeToBlockHeap, block_free);
+CAFE_EXPORT(coreinit, MEMDestroyBlockHeap, block_destroy);
+CAFE_EXPORT(coreinit, MEMGetTotalFreeSizeForBlockHeap, block_total_free);
+CAFE_EXPORT(coreinit, MEMGetAllocatableSizeForBlockHeapEx, block_largest_free);
+CAFE_EXPORT(coreinit, MEMGetTrackingLeftInBlockHeap, block_tracking_left);
+CAFE_EXPORT(coreinit, MEMAddBlockHeapTracking, block_add_tracking);
 CAFE_EXPORT(coreinit, MEMCreateUnitHeapEx, unit_create);
 CAFE_EXPORT(coreinit, MEMAllocFromUnitHeap, unit_alloc);
 CAFE_EXPORT(coreinit, MEMFreeToUnitHeap, unit_free);
@@ -573,7 +745,7 @@ CAFE_EXPORT(coreinit, OSIsAddressRangeDCValid, one);
 CAFE_EXPORT(coreinit, OSIsEnabledOverlayArena, zero);
 CAFE_EXPORT(coreinit, IMIsAPDEnabledBySysSettings, zero); // auto power-down is off
 CAFE_EXPORT(coreinit, OSEnableForegroundExit, no_op);
-CAFE_EXPORT(coreinit, DCStoreRange, no_op);
+CAFE_EXPORT(coreinit, DCStoreRange, dc_store_range);
 CAFE_EXPORT(proc_ui, ProcUIInShutdown, zero);
 
 CAFE_EXPORT(gx2, GX2GetVertexShaderGPRs, shader_gprs);
@@ -591,6 +763,30 @@ CAFE_EXPORT(gx2, GX2QueryBeginConditionalRender, query_no_op);
 CAFE_EXPORT(gx2, GX2QueryEndConditionalRender, query_no_op);
 
 // Wii MotionPlus: no Wii Remote, so none attached.
+// Super Mario Maker's batch (19 Nov): MotionPlus / gyro corrections of controllers that are not there, settings with
+// nothing behind them here. IMGetTimeBeforeAPD: auto power-down is off, an hour is always left.
+uint32_t maker_time_before_apd(uint32_t seconds) { if (seconds) *guest<be<uint32_t>>(seconds) = 3600; return 0; }
+CAFE_EXPORT(padscore, KPADDisableMplsDirRevise, no_op);
+CAFE_EXPORT(padscore, KPADDisableMplsDpdRevise, no_op);
+CAFE_EXPORT(padscore, KPADEnableMplsDirRevise, no_op);
+CAFE_EXPORT(padscore, KPADEnableMplsDpdRevise, no_op);
+CAFE_EXPORT(padscore, KPADGetMplsZeroDriftMode, zero);
+CAFE_EXPORT(padscore, KPADSetMplsDirReviseBase, no_op);
+CAFE_EXPORT(padscore, KPADSetMplsDirReviseParam, no_op);
+CAFE_EXPORT(padscore, KPADSetMplsDirection, no_op);
+CAFE_EXPORT(padscore, KPADSetMplsDpdReviseParam, no_op);
+CAFE_EXPORT(padscore, KPADSetMplsZeroDriftMode, no_op);
+CAFE_EXPORT(padscore, WPADEnableWiiRemote, no_op);
+CAFE_EXPORT(vpad, VPADDisableGyroDirRevise, no_op);
+CAFE_EXPORT(vpad, VPADEnableGyroDirRevise, no_op);
+CAFE_EXPORT(vpad, VPADGetGyroZeroDriftMode, zero);
+CAFE_EXPORT(vpad, VPADSetGyroZeroDriftMode, no_op);
+CAFE_EXPORT(coreinit, IMGetTimeBeforeAPD, maker_time_before_apd);
+CAFE_EXPORT(coreinit, LCGetDMAQueueLength, zero);
+CAFE_EXPORT(coreinit, OSGetMainCoreId, one);
+CAFE_EXPORT(snd_core, AXRegisterExceedCallback, zero);
+CAFE_EXPORT(gx2, GX2SetAAMode, no_op);          // the renderer takes the sample count from each surface
+CAFE_EXPORT(gx2, GX2SetHiStencilInfo, no_op);   // hierarchical stencil is an optimisation of the console's GPU
 CAFE_EXPORT(padscore, KPADDisableMpls, no_op);
 CAFE_EXPORT(padscore, KPADEnableMpls, no_op);
 CAFE_EXPORT(padscore, KPADGetMplsWorkSize, kpad_mpls_work_size);

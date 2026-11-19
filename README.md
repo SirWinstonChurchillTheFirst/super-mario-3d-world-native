@@ -7,7 +7,7 @@ translated to C++ ahead of time and runs on a reimplementation of the Wii U's sy
 > unpacked to `code/`, `content/`, `meta/`. The translated C++ and the program built from it contain the game's
 > code: do not share them. Not affiliated with or endorsed by Nintendo.
 
-## Status (19 November 2026): reaches World 1-1, barely tested
+## Status (19 November 2026, later): World 1-1 is played by script, still little tested
 
 Tested on one PC (Windows 11, GeForce RTX 3070 Ti, 1280x720), with scripted button presses only.
 
@@ -18,10 +18,12 @@ Tested on one PC (Windows 11, GeForce RTX 3070 Ti, 1280x720), with scripted butt
 | Controller notice, title screen, file select, character select | shown, look right |
 | Opening scene | plays |
 | World map | shown, looks right; Mario walks onto World 1-1 |
-| World 1-1 | starts: level, Mario, timer and score are drawn; about 20 seconds seen, nothing played |
+| World 1-1 | played by a blind input script for about two minutes: running, jumping, Goombas, clear pipes, shadows, falling off ("Too Bad!") and the restart of the level all look right. The level was **not finished** |
 | Sound | present in a recording of the output (not listened to). Reverb, chorus and delay are not computed |
-| Speed | the game's 60 frames/s are held; the renderer needs 1.5 to 3 ms per frame on that card |
-| Controller, saving and loading, anything after the first seconds of World 1-1, GamePad screen | **not tested** |
+| Speed | 59 to 60 frames/s without picture captures (title and opening measured that way), single late pictures of 15 to 70 ms at scene changes; the renderer needs 1.5 to 4 ms per frame on that card. Each picture capture of the test tools costs about 0.1 s, so captured runs show 56 to 58 |
+| Saving and loading | **not tested**: the game saves when a level is finished, and the script does not finish one |
+| Controller, GamePad screen, everything after World 1-1 | **not tested** |
+| Linux program for a small AMD box (Batocera) | built, package and install script in `console/`; **never run there** |
 
 Known gaps: Mii data files of the console (`FFLRes*.dat`) are not part of a game dump and are missing; occlusion
 queries are not run (conditional draws are always drawn); Miiverse and online services answer "offline".
@@ -37,12 +39,17 @@ Wii U runtime by Petexy (MIT). All credit for the recompiler and the runtime goe
   made them, each with the reason in its header. The one this game needed most:
   `patch_fetch_2101010.py` (vertex data format 2_10_10_10 in the shader translator; without it the scene's models
   were not drawn).
+  The 2_10_10_10 bit layout was checked against Cemu's source (read as a reference only): X in bits 0-9, Y 10-19,
+  Z 20-29, W 30-31.
 - `port/game_main.cpp`: a game-neutral entry program. `port/os_extra.cpp`: system functions other titles need.
 - `port/setup.sh GAME_FOLDER NAME`: the Linux build steps in order (written down from the steps done by hand; the
   script as a whole has not been run). `port/run.sh` starts the result. `port/iter.sh` is the build-and-run loop.
 - `tools/run_gpu.sh`, `tools/wincap_loop.py`: run the Windows build with scripted presses, record sound and frame
   times, photograph the window.
-- `tools/rpxinfo.py`: prints facts about an RPX.
+- `tools/rpxinfo.py`: prints facts about an RPX. `tools/win_build.sh`, `tools/quick.sh`: Windows build of one title and a
+  run without a window that prints the next missing system function.
+- `console/launch.sh`, `console/deploy.sh`, `console/install_entry.py`: start script and installer for a Batocera box
+  (written for one particular setup with its own front end; not run yet).
 
 The system font is not part of a game dump either: copy your console's `CafeStd.ttf` to `build-NAME/fonts/`;
 until then DejaVu Sans stands in.
