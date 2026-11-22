@@ -167,7 +167,7 @@ index b5cbc80..d0dc937 100644
      // game says the connection could not be made.
      if (m == "nn_olv" || m == "nn_olv2" || m == "nn_boss" || m == "nn_uds") {
 diff --git a/runtime/src/gpu/command_processor.cpp b/runtime/src/gpu/command_processor.cpp
-index eff48db..c211eed 100644
+index eff48db..8fb455b 100644
 --- a/runtime/src/gpu/command_processor.cpp
 +++ b/runtime/src/gpu/command_processor.cpp
 @@ -183,7 +183,7 @@ void execute(uint32_t address, uint32_t words, int depth);
@@ -179,7 +179,18 @@ index eff48db..c211eed 100644
      uint64_t done;     // the backend's completion value (Backend::flush)
      uint32_t address;
      uint64_t data;
-@@ -216,6 +216,7 @@ void retirement_main() {
+@@ -209,13 +209,18 @@ void retirement_main() {
+             r = g_retire_queue.front();
+             g_retire_queue.pop_front();
+         }
++        const uint64_t t0 = stat_now_ns();
+         g_backend->wait_for(r.done);
++        const uint64_t t1 = stat_now_ns();
+         g_backend->retired(r.done);
++        add_stat(kStatGpuWait, t1 - t0);
++        add_stat(kStatWriteBack, stat_now_ns() - t1);
+         switch (r.kind) {
+         case Retirement::kTimestamp: retire(r.data); break;
          case Retirement::kWrite32: wr32(r.address, static_cast<uint32_t>(r.data)); break;
          case Retirement::kWrite64: wr64(r.address, r.data); break;
          case Retirement::kWriteClock: wr64(r.address, clock()); break;
@@ -187,7 +198,7 @@ index eff48db..c211eed 100644
          }
      }
  }
-@@ -387,6 +388,8 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
+@@ -387,6 +392,8 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
          case 3: retire_later({Retirement::kWriteClock, g_backend->flush(), target, 0}); break;
          default: break;
          }
@@ -196,8 +207,31 @@ index eff48db..c211eed 100644
          break;
      }
      case pm4::kMemWrite: {
+@@ -582,8 +589,10 @@ void command_processor_main() {
+             }
+             for (const auto& [address, size] : written) g_backend->cpu_wrote(address, size);
+         }
++        const uint64_t t0 = stat_now_ns();
+         execute(s.buffer, s.words, 0);
+         retire_later({Retirement::kTimestamp, g_backend->flush(), 0, s.timestamp});
++        add_stat(kStatCp, stat_now_ns() - t0);
+     }
+ }
+ 
+@@ -626,7 +635,10 @@ uint64_t retired_timestamp() {
+ 
+ bool wait_timestamp(uint64_t timestamp, uint64_t timeout_ns) {
+     os::KernelLock lock(os::kernel_mutex());
+-    return os::wait_until_for(lock, os::kWaitGpu, timeout_ns, [&] { return g_retired >= timestamp; });
++    const uint64_t t0 = stat_now_ns();
++    const bool done = os::wait_until_for(lock, os::kWaitGpu, timeout_ns, [&] { return g_retired >= timestamp; });
++    add_stat(kStatGuestTs, stat_now_ns() - t0);
++    return done;
+ }
+ 
+ uint64_t clock() { return cafe_ppc_timebase(); }
 diff --git a/runtime/src/gpu/display.cpp b/runtime/src/gpu/display.cpp
-index a91815d..dfb51a7 100644
+index a91815d..2a7ac24 100644
 --- a/runtime/src/gpu/display.cpp
 +++ b/runtime/src/gpu/display.cpp
 @@ -8,6 +8,12 @@
@@ -213,7 +247,34 @@ index a91815d..dfb51a7 100644
  #include <algorithm>
  #include <atomic>
  #include <chrono>
-@@ -30,7 +36,54 @@ uint64_t g_vsyncs = 0;
+@@ -16,6 +22,26 @@
+ extern "C" uint64_t cafe_ppc_timebase(void);
+ 
+ namespace cafe::gpu {
++namespace {
++std::atomic<uint64_t> g_stats[kStatCount];
++uint64_t g_stat_flips = 0;
++uint64_t g_stat_vsyncs = 0;
++}
++
++bool wait_log_enabled() {
++    static const bool on = std::getenv("TTT2_WAIT_LOG") != nullptr;
++    return on;
++}
++
++void add_stat(Stat stat, uint64_t value) {
++    if (wait_log_enabled()) g_stats[stat].fetch_add(value, std::memory_order_relaxed);
++}
++
++uint64_t stat_now_ns() {
++    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
+ namespace {
+ 
+ constexpr auto kRefreshPeriod = std::chrono::nanoseconds(1001000000 / 60); // 59.94 Hz
+@@ -30,7 +56,54 @@ uint64_t g_vsyncs = 0;
  uint64_t g_last_flip_vsync = 0;
  uint32_t g_swap_interval = 1;
  
@@ -268,7 +329,7 @@ index a91815d..dfb51a7 100644
      ++g_flips;
      g_last_flip = now;
      g_last_flip_vsync = g_vsyncs;
-@@ -46,6 +99,7 @@ int64_t steady_ns() {
+@@ -46,12 +119,27 @@ int64_t steady_ns() {
  }
  
  void vsync_locked() {
@@ -276,7 +337,27 @@ index a91815d..dfb51a7 100644
      const uint64_t now = cafe_ppc_timebase();
      ++g_vsyncs;
      g_last_vsync = now;
-@@ -80,6 +134,38 @@ void display_main() {
+     if (g_frames_ready > g_flips && g_vsyncs - g_last_flip_vsync >= std::max<uint32_t>(g_swap_interval, 1)) {
+         flip(now);
+     }
++    if (wait_log_enabled() && g_vsyncs - g_stat_vsyncs >= 60) {
++        const uint64_t frames = std::max<uint64_t>(g_flips - g_stat_flips, 1);
++        uint64_t s[kStatCount];
++        for (int i = 0; i < kStatCount; ++i) s[i] = g_stats[i].exchange(0);
++        const auto ms = [&](int i) { return static_cast<double>(s[i]) / 1e6 / static_cast<double>(frames); };
++        std::fprintf(stderr, "waitlog: %llu frames/%llu blanks | per frame: cp %.2f ms, retire gpu-wait %.2f ms, "
++                     "write-back %.2f ms (%.0f KB) | title waits: timestamp %.2f ms, vsync %.2f ms, flip %.2f ms | swap interval %u\n",
++                     static_cast<unsigned long long>(g_flips - g_stat_flips),
++                     static_cast<unsigned long long>(g_vsyncs - g_stat_vsyncs), ms(kStatCp), ms(kStatGpuWait),
++                     ms(kStatWriteBack), static_cast<double>(s[kStatWriteBackBytes]) / 1024.0 / static_cast<double>(frames),
++                     ms(kStatGuestTs), ms(kStatGuestVsync), ms(kStatGuestFlip), g_swap_interval);
++        g_stat_flips = g_flips;
++        g_stat_vsyncs = g_vsyncs;
++    }
+     os::wake(os::kWaitDisplay);
+ }
+ 
+@@ -80,6 +168,38 @@ void display_main() {
  
  } // namespace
  
@@ -315,11 +396,45 @@ index a91815d..dfb51a7 100644
  void host_vsync(uint32_t count) {
      os::KernelLock lock(os::kernel_mutex());
      g_last_host_vsync.store(steady_ns());
+@@ -124,14 +244,18 @@ void frame_ready() {
+ void wait_for_vsync() {
+     os::KernelLock lock(os::kernel_mutex());
+     const uint64_t target = g_vsyncs + 1;
++    const uint64_t t0 = stat_now_ns();
+     os::wait_until(lock, os::kWaitDisplay, [&] { return g_vsyncs >= target; });
++    add_stat(kStatGuestVsync, stat_now_ns() - t0);
+ }
+ 
+ void wait_for_flip() {
+     os::KernelLock lock(os::kernel_mutex());
+     if (g_flips == g_swaps) return; // nothing pending
+     const uint32_t target = g_flips + 1;
++    const uint64_t t0 = stat_now_ns();
+     os::wait_until(lock, os::kWaitDisplay, [&] { return g_flips >= target; });
++    add_stat(kStatGuestFlip, stat_now_ns() - t0);
+ }
+ 
+ void set_swap_interval(uint32_t interval) {
 diff --git a/runtime/src/gpu/gpu.h b/runtime/src/gpu/gpu.h
-index 7c1b5ee..e90ac00 100644
+index 7c1b5ee..e05e3eb 100644
 --- a/runtime/src/gpu/gpu.h
 +++ b/runtime/src/gpu/gpu.h
-@@ -101,6 +101,11 @@ void forget_timer_vsyncs();
+@@ -14,6 +14,14 @@
+ 
+ namespace cafe::gpu {
+ 
++// TTT2_WAIT_LOG: busy and wait times (nanoseconds) and write-back bytes, summed until the display
++// prints them once a second. Any thread.
++enum Stat { kStatCp, kStatGpuWait, kStatWriteBack, kStatWriteBackBytes, kStatGuestTs, kStatGuestVsync, kStatGuestFlip,
++            kStatCount };
++void add_stat(Stat stat, uint64_t value);
++uint64_t stat_now_ns();
++bool wait_log_enabled();
++
+ // Where compiled shaders and pipelines are kept between runs (before
+ // start()). Default: $XDG_CACHE_HOME/ttt2, ~/.cache/ttt2, or on Windows
+ // %LOCALAPPDATA%/ttt2.
+@@ -101,6 +109,11 @@ void forget_timer_vsyncs();
  // The host's blanks stop (presentation no longer follows the display): the
  // timer stands in from its next period.
  void host_vsync_stopped();
@@ -332,10 +447,22 @@ index 7c1b5ee..e90ac00 100644
  uint32_t swap_interval();
  
 diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
-index d591259..e098523 100644
+index d591259..f9ef03a 100644
 --- a/runtime/src/gpu/vulkan/draw.cpp
 +++ b/runtime/src/gpu/vulkan/draw.cpp
-@@ -740,6 +740,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -500,7 +500,10 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+     const uint32_t color_control = regs[reg::CB_COLOR_CONTROL];
+     const uint32_t blend_enable = (color_control >> 8) & 0xFF;
+     const bool per_mrt = (color_control >> 7) & 1;
+-    k.write_mask = regs[reg::CB_TARGET_MASK];
++    // Components the pixel shader does not output (CB_SHADER_MASK) are not written: a title that leaves
++    // its G-buffer bound as targets 1-3 while a one-output lighting shader runs keeps the G-buffer
++    // (Mario Tennis Ultra Smash; Vulkan would write undefined values). (port/patch_shader_mask.py)
++    k.write_mask = regs[reg::CB_TARGET_MASK] & regs[reg::CB_SHADER_MASK];
+     for (uint32_t i = 0; i < color_count; ++i) {
+         k.colors[i] = colors[i];
+         if (colors[i] == VK_FORMAT_UNDEFINED) continue;
+@@ -740,6 +743,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      case 0x05: case 0x15: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
      case 0x06: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
      case 0x13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuads; break;
@@ -346,7 +473,16 @@ index d591259..e098523 100644
      case 0x14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuadStrip; break;
      default:
          report_once("unsupported primitive type", r(reg::VGT_PRIMITIVE_TYPE));
-@@ -965,7 +969,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -762,7 +769,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     // Render targets.
+     std::array<const Target*, 8> colors{};
+     uint32_t color_count = 0;
+-    const uint32_t target_mask = r(reg::CB_TARGET_MASK);
++    const uint32_t target_mask = r(reg::CB_TARGET_MASK) & r(reg::CB_SHADER_MASK);
+     for (uint32_t t = 0; t < 8; ++t) {
+         const uint32_t info = r(reg::CB_COLOR0_INFO + t * 4), base = r(reg::CB_COLOR0_BASE + t * 4);
+         if (((target_mask >> (4 * t)) & 0xF) == 0 || ((info >> 2) & 0x3F) == 0 || base == 0) continue;
+@@ -965,7 +972,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      if (replaying_) replace_constants(draw_index, dc);
      const VkDeviceSize ubo_align = std::max<VkDeviceSize>(ctx_.properties.limits.minUniformBufferOffsetAlignment, 16);
      VkDeviceSize dc_offset = 0;
@@ -356,7 +492,7 @@ index d591259..e098523 100644
      VkDeviceSize reg_offset[2] = {};
      if (vs->info.uses_registers) {
          std::memcpy(upload(4096, ubo_align, reg_offset[0]), &regs.value[reg::SQ_ALU_CONSTANT0_256 >> 2], 4096);
-@@ -1069,6 +1074,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1069,6 +1077,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          }
      }
  
@@ -373,7 +509,7 @@ index d591259..e098523 100644
      // Stream-out data a run of stream-out draws wrote, read by the draws
      // after it (skinned vertices, text): a barrier first, outside the pass.
      const bool writes_stream_out = stream_out && !replaying_;
-@@ -1186,7 +1201,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1186,7 +1204,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      }
      viewport.minDepth = std::clamp(viewport.minDepth, 0.0f, 1.0f);
      viewport.maxDepth = std::clamp(viewport.maxDepth, 0.0f, 1.0f);
@@ -387,7 +523,7 @@ index d591259..e098523 100644
      vkCmdSetViewport(c, 0, 1, &viewport);
      const uint32_t tl = r(reg::PA_SC_GENERIC_SCISSOR_TL), br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4);
      const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
-@@ -1325,7 +1345,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1325,7 +1348,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          vkCmdBindIndexBuffer(c, ring_.buffer(), index_offset, VK_INDEX_TYPE_UINT32);
          vkCmdDrawIndexed(c, index_count, instances, 0, 0, 0);
      } else {
@@ -412,10 +548,19 @@ index 9911027..86300a5 100644
                                 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
 diff --git a/runtime/src/gpu/vulkan/targets.cpp b/runtime/src/gpu/vulkan/targets.cpp
-index 5bd50e6..3aa10a3 100644
+index 5bd50e6..142866d 100644
 --- a/runtime/src/gpu/vulkan/targets.cpp
 +++ b/runtime/src/gpu/vulkan/targets.cpp
-@@ -181,8 +181,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
+@@ -11,6 +11,8 @@
+ #include "cafe/runtime.h"
+ 
+ #include <algorithm>
++#include <cmath>
++#include <set>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -181,8 +183,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
      barrier();
      VkImageBlit blit{};
      blit.srcSubresource = blit.dstSubresource = {old.aspect, 0, 0, 1};
@@ -431,6 +576,83 @@ index 5bd50e6..3aa10a3 100644
      vkCmdBlitImage(cmd(), old.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                     t.depth || scale == t.scale ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
      barrier();
+@@ -245,6 +252,44 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
+     profile_mark("clear depth", t->address, t->image.width, t->image.height);
+     t->written = stamp();
+     note_target_written(t);
++    // A title may clear a colour target through a depth view of the same memory (Mario Tennis
++    // Ultra Smash fills its 16-bit float linear-depth target with the largest half float by
++    // clearing it as 16-bit depth to 0.48436 = 0x7BFF). The console writes the same bytes either
++    // way; here the colour image of the same place and size gets the value those bytes mean.
++    // (port/patch_depth_clear_alias.py)
++    if ((flags & 1) && t->format == gx2::surface_format::kUnormR16) {
++        const uint32_t raw = static_cast<uint32_t>(std::lround(std::clamp(depth, 0.0f, 1.0f) * 65535.0f));
++        for (auto& other : targets_) {
++            Target* ct = other.get();
++            if (ct->depth || ct->address != t->address || ct->pitch != t->pitch || ct->height != t->height) continue;
++            if (color_format(ct->format).bytes != 2) continue;
++            VkClearColorValue cv{};
++            if (ct->format == 0x806) { // 16-bit float
++                const uint32_t e = (raw >> 10) & 0x1F, m = raw & 0x3FF;
++                float v = e == 0 ? std::ldexp(static_cast<float>(m), -24)
++                                 : e == 31 ? (m ? NAN : INFINITY) : std::ldexp(static_cast<float>(m | 0x400), static_cast<int>(e) - 25);
++                cv.float32[0] = (raw & 0x8000) ? -v : v;
++            } else if (ct->format == 0x005) { // 16-bit normalized
++                cv.float32[0] = static_cast<float>(raw) / 65535.0f;
++            } else {
++                static std::set<uint32_t> said;
++                if (said.insert(ct->format).second) {
++                    std::fprintf(stderr, "ttt2: gpu: depth clear over a colour target of format 0x%03X at 0x%08X: colour left as it was\n",
++                                 ct->format, ct->address);
++                }
++                continue;
++            }
++            VkImageSubresourceRange crange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++            vkCmdClearColorImage(cmd(), ct->image.image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &crange);
++            barrier();
++            ct->written = stamp();
++            note_target_written(ct);
++            if (tracing()) {
++                std::fprintf(stderr, "trace:   also colour 0x%08X fmt 0x%03X = %g\n", ct->address, ct->format,
++                             static_cast<double>(cv.float32[0]));
++            }
++        }
++    }
+     if (tracing()) {
+         std::fprintf(stderr, "trace: clear depth 0x%08X fmt 0x%03X %ux%u flags %u (%g, %u)\n", t->address, t->format,
+                      t->pitch, t->height, flags, depth, stencil);
+@@ -438,9 +483,20 @@ void Renderer::copy_write_backs() {
+         if (!guest_memory_committed(t->address, t->pitch * t->height * bytes)) continue;
+         if (write_back_free_.empty()) {
+             write_back_free_.push_back(static_cast<uint32_t>(write_back_staging_.size()));
+-            write_back_staging_.push_back(ctx_.create_buffer(
+-                kWriteBackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
++            // Cached memory where there is some: the CPU reads every byte when it tiles the copy into guest
++            // memory, and uncached (write-combined) memory made that 16 MB/s on an APU (port/patch_writeback_cached.py).
++            VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++            for (uint32_t i = 0; i < ctx_.memory.memoryTypeCount; ++i) {
++                const auto cached = flags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++                if ((ctx_.memory.memoryTypes[i].propertyFlags & cached) == cached) {
++                    flags = cached;
++                    break;
++                }
++            }
++            static const bool said = (std::fprintf(stderr, "ttt2: GPU: write-backs read from %s memory\n",
++                                                   (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "cached" : "uncached"), true);
++            (void)said;
++            write_back_staging_.push_back(ctx_.create_buffer(kWriteBackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, flags));
+         }
+         const uint32_t staging = write_back_free_.back();
+         write_back_free_.pop_back();
+@@ -492,6 +548,7 @@ void Renderer::retired(uint64_t value) {
+         level.slices = 1;
+         level.samples = 1;
+         tile(level, w.pitch, w.height, 0, 1, data);
++        add_stat(kStatWriteBackBytes, uint64_t{w.pitch} * w.height * w.bpp / 8);
+         std::lock_guard lock(write_back_mutex_);
+         write_back_free_.push_back(w.staging);
+     }
 diff --git a/runtime/src/gx2/cbpool.cpp b/runtime/src/gx2/cbpool.cpp
 index 09327e6..699483d 100644
 --- a/runtime/src/gx2/cbpool.cpp
@@ -572,6 +794,28 @@ index e403aff..4cde864 100644
  CAFE_EXPORT(gx2, GX2ResolveAAColorBuffer, GX2ResolveAAColorBuffer);
  CAFE_EXPORT(gx2, GX2ExpandDepthBuffer, GX2ExpandDepthBuffer);
  CAFE_EXPORT(gx2, GX2ConvertDepthBufferToTextureSurface, GX2ConvertDepthBufferToTextureSurface);
+diff --git a/runtime/src/latte/cafe_shader_main.cpp b/runtime/src/latte/cafe_shader_main.cpp
+index 557d5b0..41b1cd5 100644
+--- a/runtime/src/latte/cafe_shader_main.cpp
++++ b/runtime/src/latte/cafe_shader_main.cpp
+@@ -62,7 +62,7 @@ int check(const char* directory) {
+         std::string error;
+         ++shaders;
+         if (!cafe::latte::decode(words, program, error)) {
+-            std::printf("%s: %s\n", entry.path().filename().c_str(), error.c_str());
++            std::printf("%s: %s\n", entry.path().filename().string().c_str(), error.c_str());
+             ++failures;
+             continue;
+         }
+@@ -113,7 +113,7 @@ int translate_all(const std::filesystem::path& directory, const char* out_dir) {
+     std::map<std::string, int> errors;
+     int draws = 0, failures = 0;
+     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+-        const std::string name = entry.path().filename();
++        const std::string name = entry.path().filename().string();
+         if (entry.path().extension() != ".regs") continue;
+         // draw_<vs>_<ps>_<fs>.regs
+         const std::string vs = name.substr(5, 16), ps = name.substr(22, 16), fs = name.substr(39, 16);
 diff --git a/runtime/src/latte/environment.cpp b/runtime/src/latte/environment.cpp
 index 6988565..5a368aa 100644
 --- a/runtime/src/latte/environment.cpp
@@ -594,7 +838,7 @@ index 6988565..5a368aa 100644
      } else {
          h.add(env.ps_front_face | (env.ps_front_face_all_bits << 1) | (env.ps_front_face_gpr << 2) |
 diff --git a/runtime/src/latte/translate.cpp b/runtime/src/latte/translate.cpp
-index 1e9f5d4..0809dd1 100644
+index 1e9f5d4..191adef 100644
 --- a/runtime/src/latte/translate.cpp
 +++ b/runtime/src/latte/translate.cpp
 @@ -1,3 +1,4 @@
@@ -646,7 +890,20 @@ index 1e9f5d4..0809dd1 100644
          line("gl_PointSize = dc.params.y;"); // PA_SU_POINT_SIZE unless the shader exports a size
          for (int k = 0; k < env_.ps_input_count; ++k) {
              bool exported = false;
-@@ -1497,7 +1513,44 @@ bool Translator::run(std::string& error) {
+@@ -1479,7 +1495,11 @@ bool Translator::run(std::string& error) {
+                                  "ivec4 AR = ivec4(0);\nivec4 ARn = ivec4(0);\nint AL = 0;\n",
+                                  gpr_count_);
+     if (uses_gradients_) globals += "vec4 gradH = vec4(0.0);\nvec4 gradV = vec4(0.0);\n";
+-    std::string init = format("    for (int i = 0; i < %d; ++i) R[i] = ivec4(0);\n", gpr_count_);
++    // One statement per register, no loop: every access to R has a constant index then, and a driver that does
++    // not unroll a 128-step loop (Mesa's RADV on the console's Vega 6) can still keep the registers out of
++    // memory. (port/patch_reg_init.py)
++    std::string init;
++    for (int k = 0; k < gpr_count_; ++k) init += format("    R[%d] = ivec4(0);\n", k);
+     if (relative_) {
+         // Relative addressing ranges over the program's registers; every
+         // access to the register file has a constant index (see gpr()).
+@@ -1497,7 +1517,44 @@ bool Translator::run(std::string& error) {
          store += "    }\n}\n";
          globals += load + store;
      }

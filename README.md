@@ -7,7 +7,7 @@ translated to C++ ahead of time and runs on a reimplementation of the Wii U's sy
 > unpacked to `code/`, `content/`, `meta/`. The translated C++ and the program built from it contain the game's
 > code: do not share them. Not affiliated with or endorsed by Nintendo.
 
-## Status (19 November 2026, morning): World 1-1 is played by script on the PC; on the console it runs at half speed
+## Status (22 November 2026): World 1-1 is played by script on the PC and on the console, at 60 frames/s on both
 
 Tested on one PC (Windows 11, GeForce RTX 3070 Ti, 1280x720), with scripted button presses only.
 
@@ -23,7 +23,7 @@ Tested on one PC (Windows 11, GeForce RTX 3070 Ti, 1280x720), with scripted butt
 | Speed | 59 to 60 frames/s without picture captures (title and opening measured that way), single late pictures of 15 to 70 ms at scene changes; the renderer needs 1.5 to 4 ms per frame on that card. Each picture capture of the test tools costs about 0.1 s, so captured runs show 56 to 58 |
 | Saving and loading | **not tested**: the game saves when a level is finished, and the script does not finish one |
 | Controller, GamePad screen, everything after World 1-1 | **not tested** |
-| Linux program on a small AMD box (Batocera, Ryzen 3 PRO 4350GE, Vega 6, 1080p TV) | **runs, at half speed**: installed with `console/deploy.sh`, started through the menu; title 60 frames/s, from the file select on a steady 30 (the game then runs in slow motion). Opening scene and world map look right there. Measured: the game's own threads need about 10 % of one core; per frame the renderer's command thread needs about 6 ms, its retirement thread 8.5 ms and the graphics chip 7 ms, which together miss one 60 Hz refresh. Not solved. Two things had to be fixed first: the runtime renders at 2560x1440 by default on a 1080p screen (1.6 frames/s; `TTT2_SCALE=1` is set by `console/launch.sh` now), and translated shaders zeroed their registers in a loop that Mesa does not unroll (4.6 frames/s; `port/patch_night4.py`). After the game is ended with the hotkey, Alt+F4 stays "held" on Batocera's virtual hotkey keyboard and the next game closes after 3 s; `launch.sh` releases it before and after a run, the cause is not found |
+| Linux program on a small AMD box (Batocera, Ryzen 3 PRO 4350GE, Vega 6, 1080p TV) | **runs at 59 to 60 frames/s** (22 November): installed with `console/deploy.sh`, started through the menu, World 1-1 reached by script, picture right, the game's sound stream plays (not listened to). It held 30 before: the title waits every frame for a GPU timestamp, and the runtime only lets one retire after it has copied the small render targets back into guest memory. Those copies were read from uncached (write-combined) memory on this APU: 140 KB took 8.4 ms a frame. With cached staging memory (`port/patch_writeback_cached.py`) they take 0.15 to 0.3 ms and the title waits 9 ms instead of 18 (measured with `TTT2_WAIT_LOG=1`, `port/patch_waitlog.py`). Also needed earlier: `TTT2_SCALE=1` (set by `console/launch.sh`) and `port/patch_night4.py`. The held Alt+F4 after quitting is now released by the console's menu program before and after every game (cause: Batocera's `hotkeygen --send exit` removes its short-lived keyboard right after the release, which can be lost); `launch.sh` still checks too |
 
 Known gaps: Mii data files of the console (`FFLRes*.dat`) are not part of a game dump and are missing; occlusion
 queries are not run (conditional draws are always drawn); Miiverse and online services answer "offline".
