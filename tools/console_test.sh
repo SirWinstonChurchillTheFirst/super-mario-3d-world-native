@@ -14,6 +14,7 @@ B=/userdata/ports-native/wiiu/$NAME
 run=$(ssh -o ConnectTimeout=10 $H 'curl -s -m 3 localhost:1234/runningGame' 2>/dev/null)
 echo "$run" | grep -q "NO GAME RUNNING\|\"name\": \"Nova Home\"" || { echo "stop: a game is running on the console"; exit 1; }
 ssh $H "rm -rf $B/save-test; mkdir -p $B/save-test; rm -f /tmp/wiiu-*.jpg
+[ -x /tmp/tguard.sh ] && (/tmp/tguard.sh $((SECS+30)) &)
 cat > /tmp/wiiutest.env <<EOF
 export CAFE_SAVE_DIR=$B/save-test TTT2_TRACE_PACING=1 TTT2_INPUT_SCRIPT='$INPUT' $EXTRA
 EOF
@@ -25,7 +26,7 @@ while [ \$t -lt $SECS ]; do
   pgrep -x cafegame >/dev/null || { echo \"game ended by itself after about \$t s\"; break; }
 done
 echo \"sound streams: \$(pactl list short sink-inputs 2>/dev/null | wc -l)\"; pactl list sink-inputs 2>/dev/null | grep -i 'application.name\|Corked\|Sink:' | head -6
-cat /proc/loadavg
+cat /proc/loadavg; cat /tmp/tguard.out 2>/dev/null
 rm -f /tmp/wiiutest.env
 curl -s -m 5 localhost:1234/emukill >/dev/null; sleep 6
 pgrep -x cafegame >/dev/null && { echo 'still running after emukill -> kill'; pkill -x cafegame; sleep 2; }

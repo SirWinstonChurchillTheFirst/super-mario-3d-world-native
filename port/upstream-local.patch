@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 3c3e931..4f671d3 100644
+index 3c3e931..97efb60 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -58,7 +58,7 @@ add_subdirectory(recomp)
@@ -11,7 +11,7 @@ index 3c3e931..4f671d3 100644
  endif()
  
  # How the generated code is compiled, here and by the launcher's kit on the
-@@ -133,5 +133,20 @@ endif()
+@@ -133,5 +133,27 @@ endif()
  # The players' launcher (launcher/): builds the game program on the player's
  # PC from their .wua, installs it and adds Tekken 7's characters.
  if(UNIX)
@@ -25,7 +25,14 @@ index 3c3e931..4f671d3 100644
 +set(GAME_EXTRA "" CACHE STRING "more sources (netplay_none.cpp on Linux)")
 +if(GAME_GENERATED_DIR)
 +    include(${GAME_GENERATED_DIR}/sources.cmake)
-+    add_library(game_generated OBJECT ${CAFE_GENERATED_SOURCES})
++    # port/patch_modules.py: more modules (their tables renamed by port/module_rename.py)
++    set(GAME_MODULE_DIRS "" CACHE STRING "more cafe-recomp output folders (program modules)")
++    set(GAME_ALL_SOURCES ${CAFE_GENERATED_SOURCES})
++    foreach(dir ${GAME_MODULE_DIRS})
++        include(${dir}/sources.cmake)
++        list(APPEND GAME_ALL_SOURCES ${CAFE_GENERATED_SOURCES})
++    endforeach()
++    add_library(game_generated OBJECT ${GAME_ALL_SOURCES})
 +    target_include_directories(game_generated PRIVATE runtime/include)
 +    target_compile_features(game_generated PRIVATE cxx_std_20)
 +    target_compile_options(game_generated PRIVATE ${TTT2_GENERATED_OPTIONS})
@@ -34,10 +41,18 @@ index 3c3e931..4f671d3 100644
 +    target_link_libraries(cafegame PRIVATE cafe_runtime game_generated)
  endif()
 diff --git a/recomp/src/rpx.cpp b/recomp/src/rpx.cpp
-index b445761..a8b0fe7 100644
+index b445761..2f51d1b 100644
 --- a/recomp/src/rpx.cpp
 +++ b/recomp/src/rpx.cpp
-@@ -93,7 +93,7 @@ void apply_relocation(Image& image, const Relocation& relocation) {
+@@ -1,3 +1,7 @@
++#include <string>
++#include <map>
++#include <cstdlib>
++#include <cstdio>
+ #include "rpx.h"
+ 
+ #include "cafe/layout.h"
+@@ -93,7 +97,7 @@ void apply_relocation(Image& image, const Relocation& relocation) {
      const uint32_t place = relocation.offset;
      const uint32_t width = relocation.type == kRPpcAddr32 ||
                                     relocation.type == kRPpcRel24 ||
@@ -46,7 +61,7 @@ index b445761..a8b0fe7 100644
                                 ? 4
                                 : 2;
      if (!target.contains(place) || place - target.address + width > target.size ||
-@@ -136,6 +136,36 @@ void apply_relocation(Image& image, const Relocation& relocation) {
+@@ -136,6 +140,36 @@ void apply_relocation(Image& image, const Relocation& relocation) {
                               (static_cast<uint32_t>(delta) & 0xFFFCu));
          return;
      }
@@ -82,6 +97,95 @@ index b445761..a8b0fe7 100644
 +        return;
      default:
          fail("unsupported relocation type " + std::to_string(relocation.type));
+     }
+@@ -167,6 +201,15 @@ Image load(const std::filesystem::path& path, bool apply_relocations) {
+ }
+ 
+ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
++    // CAFE_RPL_REBASE=<code delta>,<data delta> (hex): a module moved to free addresses (port/patch_rpl_rebase.py).
++    uint32_t rebase_code = 0, rebase_data = 0;
++    if (const char* r = std::getenv("CAFE_RPL_REBASE")) {
++        char* end = nullptr;
++        rebase_code = static_cast<uint32_t>(std::strtoul(r, &end, 16));
++        if (end && *end == ',') rebase_data = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16));
++        std::fprintf(stderr, "rpx: moving the module: code by 0x%08X, data by 0x%08X\n", rebase_code, rebase_data);
++    }
++    std::vector<uint32_t> section_delta;
+     if (raw.size() < 52 || raw[0] != 0x7F || raw[1] != 'E' || raw[2] != 'L' ||
+         raw[3] != 'F' || raw[4] != 1 || raw[5] != 2) {
+         fail("not a big-endian ELF32 file");
+@@ -182,7 +225,7 @@ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
+     }
+ 
+     Image image;
+-    image.entry_point = read_be32(&raw[24]);
++    image.entry_point = read_be32(&raw[24]) + rebase_code;
+     image.sections.resize(shnum);
+     std::vector<uint32_t> name_offsets(shnum);
+     for (uint32_t index = 0; index < shnum; ++index) {
+@@ -193,6 +236,11 @@ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
+         section.type = read_be32(header + 4);
+         section.flags = read_be32(header + 8);
+         section.address = read_be32(header + 12);
++        section_delta.resize(shnum, 0);
++        if (section.address != 0 && (rebase_code | rebase_data)) {
++            section_delta[index] = section.address >= 0x10000000u ? rebase_data : rebase_code;
++            section.address += section_delta[index];
++        }
+         const uint32_t offset = read_be32(header + 16);
+         const uint32_t stored_size = read_be32(header + 20);
+         section.link = read_be32(header + 24);
+@@ -266,6 +314,10 @@ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
+             symbol.name = c_string(strtab, name);
+         }
+         symbol.value = read_be32(entry + 4);
++        {
++            const uint16_t home = read_be16(entry + 14);
++            if (home != 0 && home < section_delta.size()) symbol.value += section_delta[home];
++        }
+         symbol.size = read_be32(entry + 8);
+         symbol.type = entry[12] & 0xF;
+         symbol.bind = entry[12] >> 4;
+@@ -295,10 +347,30 @@ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
+     // Give each data import a slot of its own; unnamed aliases share the
+     // stub value, so remapping by value moves them too.
+     std::map<uint32_t, uint32_t> data_slots;
++    // port/patch_modules.py: a module's slots after the title's; data a translated module exports.
++    uint32_t first_slot = 0;
++    if (const char* f = std::getenv("CAFE_DATA_IMPORT_FIRST")) first_slot = static_cast<uint32_t>(std::strtoul(f, nullptr, 0));
++    std::map<std::string, uint32_t> linked;
++    if (const char* m = std::getenv("CAFE_DATA_IMPORT_MAP")) {
++        if (FILE* file = std::fopen(m, "r")) {
++            char module[128], name[256];
++            unsigned int address;
++            while (std::fscanf(file, "%127s %255s %x", module, name, &address) == 3) {
++                linked[std::string(module) + ":" + name] = address;
++            }
++            std::fclose(file);
++        }
++    }
++    uint32_t used_slots = 0;
+     for (auto& import : image.imports) {
+         if (import.is_data) {
++            if (const auto l = linked.find(import.module + ":" + import.name); l != linked.end()) {
++                import.address = l->second;
++                data_slots[import.stub_address] = import.address;
++                continue;
++            }
+             import.address = layout::kDataImportBase +
+-                             static_cast<uint32_t>(data_slots.size()) *
++                             (first_slot + used_slots++) *
+                                  layout::kDataImportSlot;
+             if (import.address >= layout::kDataImportLimit) {
+                 fail("too many data imports for the layout");
+@@ -329,7 +401,7 @@ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
+             const uint8_t* entry = section.data.data() + offset;
+             const uint32_t info = read_be32(entry + 4);
+             image.relocations.push_back(
+-                {read_be32(entry), info & 0xFF, info >> 8,
++                {read_be32(entry) + (section.info < section_delta.size() ? section_delta[section.info] : 0u), info & 0xFF, info >> 8,
+                  static_cast<int32_t>(read_be32(entry + 8)), section.info});
+         }
      }
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
 index dde7a63..8f0c541 100644
@@ -142,6 +246,19 @@ index e257ea8..392c34e 100644
      }
  }
  
+diff --git a/runtime/include/cafe/runtime.h b/runtime/include/cafe/runtime.h
+index 49e556a..7888f31 100644
+--- a/runtime/include/cafe/runtime.h
++++ b/runtime/include/cafe/runtime.h
+@@ -41,6 +41,8 @@ std::string sha256_hex(const std::vector<uint8_t>& data);
+ 
+ // ---------------------------------------------------------------- dispatch
+ void build_dispatch_table();
++// A module's translated function, for indirect calls (port/patch_modules.py).
++void register_guest_function(uint32_t address, PPCFunc* function);
+ // Gives a native function a guest-visible address (for function pointers the
+ // guest stores and calls, e.g. MEMAllocFromDefaultHeap's value).
+ uint32_t register_host_function(PPCFunc* function, const char* name);
 diff --git a/runtime/src/diagnostics.cpp b/runtime/src/diagnostics.cpp
 index b5cbc80..d0dc937 100644
 --- a/runtime/src/diagnostics.cpp
@@ -166,6 +283,23 @@ index b5cbc80..d0dc937 100644
      // Local wireless (nn_uds: Smash's 3DS-as-controller link) has no PC side either: it fails the same way, and the
      // game says the connection could not be made.
      if (m == "nn_olv" || m == "nn_olv2" || m == "nn_boss" || m == "nn_uds") {
+diff --git a/runtime/src/dispatch.cpp b/runtime/src/dispatch.cpp
+index 0516e5a..aafd3d3 100644
+--- a/runtime/src/dispatch.cpp
++++ b/runtime/src/dispatch.cpp
+@@ -41,8 +41,11 @@ void insert(uint32_t address, PPCFunc* function, bool compiled) {
+ 
+ } // namespace
+ 
++// port/patch_modules.py: a translated module's functions (it is loaded after the title).
++void register_guest_function(uint32_t address, PPCFunc* function) { insert(address, function, function != nullptr); }
++
+ void build_dispatch_table() {
+-    const size_t wanted = (cafe_guest_function_count + cafe_guest_import_count + 0x10000) * 2;
++    const size_t wanted = (cafe_guest_function_count + cafe_guest_import_count + 0x40000) * 2; // + modules
+     size_t capacity = 1;
+     while (capacity < wanted) {
+         capacity <<= 1;
 diff --git a/runtime/src/gpu/command_processor.cpp b/runtime/src/gpu/command_processor.cpp
 index eff48db..8fb455b 100644
 --- a/runtime/src/gpu/command_processor.cpp
@@ -416,7 +550,7 @@ index a91815d..2a7ac24 100644
  
  void set_swap_interval(uint32_t interval) {
 diff --git a/runtime/src/gpu/gpu.h b/runtime/src/gpu/gpu.h
-index 7c1b5ee..e05e3eb 100644
+index 7c1b5ee..bb0ac5a 100644
 --- a/runtime/src/gpu/gpu.h
 +++ b/runtime/src/gpu/gpu.h
 @@ -14,6 +14,14 @@
@@ -434,7 +568,19 @@ index 7c1b5ee..e05e3eb 100644
  // Where compiled shaders and pipelines are kept between runs (before
  // start()). Default: $XDG_CACHE_HOME/ttt2, ~/.cache/ttt2, or on Windows
  // %LOCALAPPDATA%/ttt2.
-@@ -101,6 +109,11 @@ void forget_timer_vsyncs();
+@@ -25,6 +33,11 @@ void set_cache_directory(const std::filesystem::path& directory);
+ void set_tv_height(uint32_t rows);
+ uint32_t tv_height();
+ 
++// The GX2 surface format a title declared for a scan buffer (0 TV, 1 GamePad), from GX2SetTVBuffer /
++// GX2SetDRCBuffer: its sRGB bit decides whether the copy into it encodes (port/patch_scan_srgb.py). Any thread.
++void set_scan_format(int index, uint32_t format);
++uint32_t scan_format(int index);
++
+ // Traces the next frame the GPU finishes: its draws, and with TTT2_CAPTURE
+ // set, its render targets as PNG files (F12 in the window). Any thread.
+ void request_frame_trace();
+@@ -101,6 +114,11 @@ void forget_timer_vsyncs();
  // The host's blanks stop (presentation no longer follows the display): the
  // timer stands in from its next period.
  void host_vsync_stopped();
@@ -547,20 +693,108 @@ index 9911027..86300a5 100644
      g_rgba16_snorm = supported(physical, VK_FORMAT_R16G16B16A16_SNORM,
                                 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+diff --git a/runtime/src/gpu/vulkan/renderer.cpp b/runtime/src/gpu/vulkan/renderer.cpp
+index c70b525..15a5192 100644
+--- a/runtime/src/gpu/vulkan/renderer.cpp
++++ b/runtime/src/gpu/vulkan/renderer.cpp
+@@ -40,6 +40,13 @@ void set_tv_height(uint32_t rows) {
+ }
+ uint32_t tv_height() { return g_tv_height; }
+ 
++// port/patch_scan_srgb.py
++namespace {
++std::atomic<uint32_t> g_scan_format[2]{};
++} // namespace
++void set_scan_format(int index, uint32_t format) { g_scan_format[index & 1] = format; }
++uint32_t scan_format(int index) { return g_scan_format[index & 1]; }
++
+ std::unique_ptr<Backend> make_vulkan_backend() { return std::make_unique<vk::Renderer>(); }
+ 
+ namespace vk {
+@@ -344,12 +351,32 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
+     const uint32_t width = std::min(scaled(buffer.surface.width, t->scale), t->image.width);
+     const uint32_t height = std::min(scaled(buffer.surface.height, t->scale), t->image.height);
+     Image& scan = scan_[index];
+-    if (scan.image == VK_NULL_HANDLE || scan.width != width || scan.height != height || scan.format != t->image.format) {
++    // The declared scan format's kind (GX2 format bit 0x400 = sRGB): a colour buffer of the other kind is converted
++    // as the console's copy does (linear values into an sRGB scan buffer are encoded), else copied as it is
++    // (port/patch_scan_srgb.py).
++    static const bool raw = std::getenv("TTT2_SCAN_RAW") != nullptr;
++    const uint32_t declared = scan_format(index);
++    const auto is_srgb = [](VkFormat f) {
++        return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
++    };
++    const bool want_srgb = (declared & 0x400) != 0;
++    const bool convert = !raw && declared != 0 && want_srgb != is_srgb(t->image.format);
++    const VkFormat scan_fmt = !convert ? t->image.format : want_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
++    if (convert) {
++        static bool said[2];
++        if (!said[index]) {
++            said[index] = true;
++            std::fprintf(stderr, "ttt2: GPU: %s scan buffer declared 0x%03X, colour buffer vk format %d: %s on the copy\n",
++                         index ? "GamePad" : "TV", declared, static_cast<int>(t->image.format),
++                         want_srgb ? "sRGB-encoded" : "sRGB-decoded");
++        }
++    }
++    if (scan.image == VK_NULL_HANDLE || scan.width != width || scan.height != height || scan.format != scan_fmt) {
+         if (scan.image != VK_NULL_HANDLE) {
+             submit(true);
+             destroy_image(scan);
+         }
+-        scan = create_image(t->image.format, VK_IMAGE_ASPECT_COLOR_BIT, width, height, 1, 1,
++        scan = create_image(scan_fmt, VK_IMAGE_ASPECT_COLOR_BIT, width, height, 1, 1,
+                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 VK_IMAGE_USAGE_SAMPLED_BIT,
+                             VK_IMAGE_VIEW_TYPE_2D);
+@@ -360,7 +387,17 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
+     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+     region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+     region.extent = {width, height, 1};
+-    vkCmdCopyImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, scan.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
++    if (convert) {
++        VkImageBlit blit{};
++        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        blit.srcOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
++        blit.dstOffsets[1] = blit.srcOffsets[1];
++        vkCmdBlitImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, scan.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
++                       VK_FILTER_NEAREST);
++    } else {
++        vkCmdCopyImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, scan.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
++    }
+     barrier();
+     scan_valid_[index] = true;
+     profile_mark("copy to scan buffer", t->address, width, height);
+diff --git a/runtime/src/gpu/vulkan/renderer.h b/runtime/src/gpu/vulkan/renderer.h
+index 6739e5d..be793b4 100644
+--- a/runtime/src/gpu/vulkan/renderer.h
++++ b/runtime/src/gpu/vulkan/renderer.h
+@@ -244,6 +244,7 @@ private:
+         uint64_t value;     // submission that copies it to staging
+         uint32_t staging;   // index in write_back_staging_
+         uint32_t address, base_reg, tile_mode, bpp, pitch, height;
++        std::vector<uint8_t> before; // guest bytes when queued (port/patch_writeback_guard.py)
+     };
+     std::vector<Target*> write_back_targets_; // written since the last submission
+     std::mutex write_back_mutex_;             // the members below: the retirement thread uses them too
 diff --git a/runtime/src/gpu/vulkan/targets.cpp b/runtime/src/gpu/vulkan/targets.cpp
-index 5bd50e6..142866d 100644
+index 5bd50e6..10d662f 100644
 --- a/runtime/src/gpu/vulkan/targets.cpp
 +++ b/runtime/src/gpu/vulkan/targets.cpp
-@@ -11,6 +11,8 @@
+@@ -10,7 +10,12 @@
+ 
  #include "cafe/runtime.h"
  
++#include <chrono>
++#include <thread>
++#include <atomic>
  #include <algorithm>
 +#include <cmath>
 +#include <set>
  #include <cstdio>
  #include <cstdlib>
  #include <cstring>
-@@ -181,8 +183,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
+@@ -181,8 +186,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
      barrier();
      VkImageBlit blit{};
      blit.srcSubresource = blit.dstSubresource = {old.aspect, 0, 0, 1};
@@ -576,7 +810,7 @@ index 5bd50e6..142866d 100644
      vkCmdBlitImage(cmd(), old.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                     t.depth || scale == t.scale ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
      barrier();
-@@ -245,6 +252,44 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
+@@ -245,6 +255,44 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
      profile_mark("clear depth", t->address, t->image.width, t->image.height);
      t->written = stamp();
      note_target_written(t);
@@ -621,7 +855,16 @@ index 5bd50e6..142866d 100644
      if (tracing()) {
          std::fprintf(stderr, "trace: clear depth 0x%08X fmt 0x%03X %ux%u flags %u (%g, %u)\n", t->address, t->format,
                       t->pitch, t->height, flags, depth, stencil);
-@@ -438,9 +483,20 @@ void Renderer::copy_write_backs() {
+@@ -420,6 +468,8 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
+ // ------------------------------------------------------------ write-back
+ 
+ void Renderer::queue_write_back(Target* t) {
++    static const bool none = std::getenv("TTT2_NO_WRITEBACK") != nullptr; // port/patch_writeback_guard.py
++    if (none) return;
+     if (!t->write_back || replaying_ || t->write_back_queued) return;
+     t->write_back_queued = true;
+     write_back_targets_.push_back(t);
+@@ -438,9 +488,20 @@ void Renderer::copy_write_backs() {
          if (!guest_memory_committed(t->address, t->pitch * t->height * bytes)) continue;
          if (write_back_free_.empty()) {
              write_back_free_.push_back(static_cast<uint32_t>(write_back_staging_.size()));
@@ -645,14 +888,85 @@ index 5bd50e6..142866d 100644
          }
          const uint32_t staging = write_back_free_.back();
          write_back_free_.pop_back();
-@@ -492,6 +548,7 @@ void Renderer::retired(uint64_t value) {
+@@ -449,7 +510,21 @@ void Renderer::copy_write_backs() {
+         region.imageExtent = {t->pitch, t->height, 1};
+         vkCmdCopyImageToBuffer(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, write_back_staging_[staging].buffer, 1,
+                                &region);
+-        write_backs_.push_back({value, staging, t->address, t->base_reg, t->tile_mode, bytes * 8, t->pitch, t->height});
++        write_backs_.push_back({value, staging, t->address, t->base_reg, t->tile_mode, bytes * 8, t->pitch, t->height, {}});
++        {
++            static const bool guard = [] {
++                const char* v = std::getenv("TTT2_WRITEBACK_GUARD");
++                return v == nullptr || *v != '0';
++            }();
++            static const bool log = std::getenv("TTT2_WRITEBACK_LOG") != nullptr;
++            const uint32_t n = t->pitch * t->height * bytes;
++            if (guard) write_backs_.back().before.assign(guest_pointer(t->address), guest_pointer(t->address) + n);
++            static std::set<uint32_t> seen;
++            if (log && seen.insert(t->address).second) {
++                std::fprintf(stderr, "ttt2: write-back: 0x%08X fmt 0x%03X %ux%u tile %u (%u bytes)\n", t->address,
++                             t->format, t->pitch, t->height, t->tile_mode, n);
++            }
++        }
+         if (tracing()) {
+             std::fprintf(stderr, "trace: write back 0x%08X fmt 0x%03X %ux%u tile %u\n", t->address, t->format, t->pitch,
+                          t->height, t->tile_mode);
+@@ -472,6 +547,19 @@ void Renderer::copy_write_backs() {
+ // (Retirement thread.) The copies of the submissions up to `value`, tiled
+ // into guest memory.
+ void Renderer::retired(uint64_t value) {
++    // port/patch_writeback_delay.py: late write-backs on purpose (test switch).
++    static const int delay_ms = [] {
++        const char* v = std::getenv("TTT2_WRITEBACK_DELAY_MS");
++        return v ? std::atoi(v) : 0;
++    }();
++    if (delay_ms > 0) {
++        bool any;
++        {
++            std::lock_guard lock(write_back_mutex_);
++            any = !write_backs_.empty() && write_backs_.front().value <= value;
++        }
++        if (any) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
++    }
+     for (;;) {
+         WriteBack w;
+         const uint8_t* data;
+@@ -482,6 +570,19 @@ void Renderer::retired(uint64_t value) {
+             write_backs_.pop_front();
+             data = write_back_staging_[w.staging].mapped;
+         }
++        const uint32_t n = w.pitch * w.height * (w.bpp / 8);
++        if (!w.before.empty() && std::memcmp(w.before.data(), guest_pointer(w.address), n) != 0) {
++            // Written since the draw was submitted: the newer data stays (port/patch_writeback_guard.py).
++            static std::atomic<uint32_t> skipped{0};
++            const uint32_t k = skipped.fetch_add(1);
++            if (k < 20 || (k & (k - 1)) == 0) {
++                std::fprintf(stderr, "ttt2: write-back of 0x%08X %ux%u skipped: guest memory changed since the draw (%u so far)\n",
++                             w.address, w.pitch, w.height, k + 1);
++            }
++            std::lock_guard lock(write_back_mutex_);
++            write_back_free_.push_back(w.staging);
++            continue;
++        }
+         TiledLevel level{};
+         level.data = guest_pointer(w.address);
+         level.base256b = w.base_reg;
+@@ -492,8 +593,15 @@ void Renderer::retired(uint64_t value) {
          level.slices = 1;
          level.samples = 1;
          tile(level, w.pitch, w.height, 0, 1, data);
 +        add_stat(kStatWriteBackBytes, uint64_t{w.pitch} * w.height * w.bpp / 8);
          std::lock_guard lock(write_back_mutex_);
          write_back_free_.push_back(w.staging);
++        // Later queued write-backs of the same place compare against what this one wrote.
++        for (WriteBack& later : write_backs_) {
++            if (later.address == w.address && !later.before.empty() && later.before.size() == n) {
++                std::memcpy(later.before.data(), guest_pointer(w.address), n);
++            }
++        }
      }
+ }
+ 
 diff --git a/runtime/src/gx2/cbpool.cpp b/runtime/src/gx2/cbpool.cpp
 index 09327e6..699483d 100644
 --- a/runtime/src/gx2/cbpool.cpp
@@ -679,7 +993,7 @@ index 09327e6..699483d 100644
  
  } // namespace cafe::gx2
 diff --git a/runtime/src/gx2/display.cpp b/runtime/src/gx2/display.cpp
-index 75aaf53..311d0a4 100644
+index 75aaf53..61152bc 100644
 --- a/runtime/src/gx2/display.cpp
 +++ b/runtime/src/gx2/display.cpp
 @@ -15,6 +15,7 @@
@@ -690,7 +1004,36 @@ index 75aaf53..311d0a4 100644
  #include <cstring>
  
  namespace cafe::gx2 {
-@@ -199,15 +200,26 @@ void GX2SampleBottomGPUCycle(be<uint64_t>* out) {
+@@ -92,6 +93,7 @@ void GX2SetTVBuffer(uint32_t buffer, uint32_t, uint32_t mode, uint32_t format, u
+     g_tv.format = format;
+     g_tv.buffering = buffering;
+     if (mode < std::size(kTvSizes)) gpu::set_tv_height(kTvSizes[mode].height);
++    gpu::set_scan_format(0, format); // port/patch_scan_srgb.py
+     std::fprintf(stderr, "ttt2: gx2: TV scan buffer 0x%08X, mode %u, format 0x%03X, %u buffers\n", buffer, mode, format,
+                  buffering);
+ }
+@@ -102,6 +104,7 @@ void GX2SetDRCBuffer(uint32_t buffer, uint32_t, uint32_t mode, uint32_t format,
+     g_drc.mode = mode;
+     g_drc.format = format;
+     g_drc.buffering = buffering;
++    gpu::set_scan_format(1, format); // port/patch_scan_srgb.py
+     std::fprintf(stderr, "ttt2: gx2: GamePad scan buffer 0x%08X, mode %u, format 0x%03X, %u buffers\n", buffer, mode,
+                  format, buffering);
+ }
+@@ -153,7 +156,11 @@ void GX2SwapScanBuffers() {
+     }
+     for (;;) {
+         const gpu::SwapStatus status = gpu::swap_status();
+-        if (status.swaps - status.flips <= kMaxPendingSwaps) break;
++        static const uint32_t max_pending = [] { // port/patch_pending_swaps.py
++            const char* v = std::getenv("TTT2_MAX_PENDING_SWAPS");
++            return v ? static_cast<uint32_t>(std::atoi(v)) : kMaxPendingSwaps;
++        }();
++        if (status.swaps - status.flips <= max_pending) break;
+         gpu::wait_for_flip();
+     }
+ }
+@@ -199,15 +206,26 @@ void GX2SampleBottomGPUCycle(be<uint64_t>* out) {
  uint64_t GX2GPUTimeToCPUTime(uint64_t time) { return time; }
  
  // GX2PipeEvent: top of pipe, bottom of pipe, bottom after cache flush.
@@ -720,7 +1063,7 @@ index 75aaf53..311d0a4 100644
      }
  }
  
-@@ -225,8 +237,11 @@ void GX2MarkScanBufferCopied(uint32_t) {}
+@@ -225,8 +243,11 @@ void GX2MarkScanBufferCopied(uint32_t) {}
  // The GamePad never connects or disconnects: no callback to make. Returns
  // the previous callback, none.
  uint32_t GX2SetDRCConnectCallback(uint32_t, uint32_t) { return 0; }
@@ -1261,10 +1604,26 @@ index 404cc34..99fdabc 100644
  CAFE_EXPORT(coreinit, FSRemove, FSRemove);
  CAFE_EXPORT(coreinit, FSRename, FSRename);
 diff --git a/runtime/src/os/heap.cpp b/runtime/src/os/heap.cpp
-index 552bb84..dbb9a37 100644
+index 552bb84..213f326 100644
 --- a/runtime/src/os/heap.cpp
 +++ b/runtime/src/os/heap.cpp
-@@ -324,6 +324,28 @@ void MEMFreeToAllocator(PPCContext& ctx, GuestAddress allocator, uint32_t block)
+@@ -303,6 +303,15 @@ uint32_t MEMGetTotalFreeSizeForExpHeap(uint32_t heap) {
+ 
+ // shortcut: allocations always come first-fit; honour the mode if a title depends on placement.
+ uint32_t MEMSetAllocModeForExpHeap(uint32_t, uint32_t) { return 0; }
++// port/patch_mblock_size.py: payload up to the block's end, as allocated (sizes are rounded up to 4).
++uint32_t MEMGetSizeForMBlockExpHeap(uint32_t payload) {
++    std::lock_guard lock(g_heap_mutex);
++    for (const auto& [handle, heap] : g_exp_heaps) {
++        const auto it = heap->used.find(payload);
++        if (it != heap->used.end()) return it->second.second - payload;
++    }
++    return 0;
++}
+ 
+ uint32_t MEMGetAllocatableSizeForFrmHeapEx(uint32_t handle, int32_t alignment) {
+     std::lock_guard lock(g_heap_mutex);
+@@ -324,9 +333,32 @@ void MEMFreeToAllocator(PPCContext& ctx, GuestAddress allocator, uint32_t block)
      call_guest(ctx, *guest<be<uint32_t>>(functions + 4), {allocator.value, block});
  }
  
@@ -1293,6 +1652,10 @@ index 552bb84..dbb9a37 100644
  CAFE_EXPORT(coreinit, MEMGetBaseHeapHandle, MEMGetBaseHeapHandle);
  CAFE_EXPORT(coreinit, MEMGetTotalFreeSizeForExpHeap, MEMGetTotalFreeSizeForExpHeap);
  CAFE_EXPORT(coreinit, MEMSetAllocModeForExpHeap, MEMSetAllocModeForExpHeap);
++CAFE_EXPORT(coreinit, MEMGetSizeForMBlockExpHeap, MEMGetSizeForMBlockExpHeap);
+ CAFE_EXPORT(coreinit, MEMGetAllocatableSizeForFrmHeapEx, MEMGetAllocatableSizeForFrmHeapEx);
+ CAFE_EXPORT(coreinit, MEMAllocFromAllocator, MEMAllocFromAllocator);
+ CAFE_EXPORT(coreinit, MEMFreeToAllocator, MEMFreeToAllocator);
 diff --git a/runtime/src/os/kernel.h b/runtime/src/os/kernel.h
 index a3de794..be75f9c 100644
 --- a/runtime/src/os/kernel.h

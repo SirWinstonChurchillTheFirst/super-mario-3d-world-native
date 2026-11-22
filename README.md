@@ -7,6 +7,10 @@ translated to C++ ahead of time and runs on a reimplementation of the Wii U's sy
 > unpacked to `code/`, `content/`, `meta/`. The translated C++ and the program built from it contain the game's
 > code: do not share them. Not affiliated with or endorsed by Nintendo.
 
+## Update 22 November 2026, afternoon: brightness as on the console
+
+The picture was much too dark. The game declares its TV and GamePad scan buffers as sRGB (format 0x41A) but renders linear values into a 10-bit UNORM colour buffer; the console's copy into the scan buffer encodes them, and Cemu does the same. The runtime copied the bytes unchanged. Now the copy converts when the declared kind and the colour buffer's kind differ (`port/patch_scan_srgb.py`; `TTT2_SCAN_RAW=1` gives the old copy). Measured on the same title-screen shot: mean brightness 132 before, 177 after, Cemu 177 (0-255). Both presentation paths were checked to show the scan buffer unchanged (`tools/console_bright.sh`).
+
 ## Status (22 November 2026): World 1-1 is played by script on the PC and on the console, at 60 frames/s on both
 
 Tested on one PC (Windows 11, GeForce RTX 3070 Ti, 1280x720), with scripted button presses only.

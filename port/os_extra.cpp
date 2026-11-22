@@ -694,10 +694,12 @@ void launch_account() { once(g_said_account, "SYSLaunchAccount: the console's ac
 CAFE_EXPORT(coreinit, OSFastMutex_TryLock, fast_mutex_try_lock);
 CAFE_EXPORT(coreinit, OSGetStackPointer, get_stack_pointer);
 CAFE_EXPORT(coreinit, OSVReport, os_vreport);
+#ifndef CAFE_PORT_MODULES // a build with the translated module (port/modules.cpp) binds these to it instead
 CAFE_EXPORT(mvplayer, Create__8MVPlayerSFv, mv_create);
 CAFE_EXPORT(mvplayer, Destroy__8MVPlayerSFP8MVPlayer, no_op);
 CAFE_EXPORT(mvplayer, Shutdown__8MVPlayerSFv, no_op);
 CAFE_EXPORT(mvplayer, Draw__6MVViewFv, no_op);
+#endif
 CAFE_EXPORT(coreinit, MPInitTask, mp_init_task);
 CAFE_EXPORT(coreinit, MPInitTaskQ, mp_init_queue);
 CAFE_EXPORT(coreinit, MPTermTaskQ, mp_term_queue);
