@@ -40,6 +40,35 @@ index 3c3e931..97efb60 100644
 +    target_include_directories(cafegame PRIVATE runtime/src)
 +    target_link_libraries(cafegame PRIVATE cafe_runtime game_generated)
  endif()
+diff --git a/recomp/src/program.cpp b/recomp/src/program.cpp
+index b70a772..20bc428 100644
+--- a/recomp/src/program.cpp
++++ b/recomp/src/program.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "ppc.h"
+ 
++#include <cstdlib>
+ #include <algorithm>
+ #include <cstdio>
+ #include <deque>
+@@ -137,6 +138,16 @@ Program Program::analyze(rpx::Image loaded) {
+     const rpx::Image& image = scratch.image;
+     const FunctionTable table = FunctionTable::build(image);
+     std::set<uint32_t> starts = entered_addresses(image);
++    // port/patch_extra_entries.py: starts the discovery missed, given by hand.
++    if (const char* extra = std::getenv("CAFE_EXTRA_ENTRIES")) {
++        for (const char* p = extra; *p;) {
++            char* end = nullptr;
++            const unsigned long a = std::strtoul(p, &end, 16);
++            if (end == p) break;
++            starts.insert(static_cast<uint32_t>(a));
++            p = *end == ',' ? end + 1 : end;
++        }
++    }
+ 
+     const auto split_gaps = [&] {
+         std::vector<FunctionInfo> bodies;
 diff --git a/recomp/src/rpx.cpp b/recomp/src/rpx.cpp
 index b445761..2f51d1b 100644
 --- a/recomp/src/rpx.cpp
@@ -301,7 +330,7 @@ index 0516e5a..aafd3d3 100644
      while (capacity < wanted) {
          capacity <<= 1;
 diff --git a/runtime/src/gpu/command_processor.cpp b/runtime/src/gpu/command_processor.cpp
-index eff48db..8fb455b 100644
+index eff48db..ab4ae44 100644
 --- a/runtime/src/gpu/command_processor.cpp
 +++ b/runtime/src/gpu/command_processor.cpp
 @@ -183,7 +183,7 @@ void execute(uint32_t address, uint32_t words, int depth);
@@ -341,7 +370,20 @@ index eff48db..8fb455b 100644
          break;
      }
      case pm4::kMemWrite: {
-@@ -582,8 +589,10 @@ void command_processor_main() {
+@@ -460,6 +467,12 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
+             if (previous != 0) {
+                 g_backend->idle(); // (a held-back submission would never finish)
+                 g_backend->wait_for(previous);
++                // port/patch_swap_retire.py: that frame's write-backs in guest memory before the title goes on.
++                static const bool retire = [] {
++                    const char* v = std::getenv("TTT2_SWAP_RETIRE");
++                    return v == nullptr || *v != '0';
++                }();
++                if (retire) g_backend->retired(previous);
+             }
+             previous = done;
+             frame_ready();
+@@ -582,8 +595,10 @@ void command_processor_main() {
              }
              for (const auto& [address, size] : written) g_backend->cpu_wrote(address, size);
          }
@@ -352,7 +394,7 @@ index eff48db..8fb455b 100644
      }
  }
  
-@@ -626,7 +635,10 @@ uint64_t retired_timestamp() {
+@@ -626,7 +641,10 @@ uint64_t retired_timestamp() {
  
  bool wait_timestamp(uint64_t timestamp, uint64_t timeout_ns) {
      os::KernelLock lock(os::kernel_mutex());
@@ -593,7 +635,7 @@ index 7c1b5ee..bb0ac5a 100644
  uint32_t swap_interval();
  
 diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
-index d591259..ce49055 100644
+index d591259..985285c 100644
 --- a/runtime/src/gpu/vulkan/draw.cpp
 +++ b/runtime/src/gpu/vulkan/draw.cpp
 @@ -2,6 +2,7 @@
@@ -616,7 +658,17 @@ index d591259..ce49055 100644
      for (uint32_t i = 0; i < color_count; ++i) {
          k.colors[i] = colors[i];
          if (colors[i] == VK_FORMAT_UNDEFINED) continue;
-@@ -740,6 +744,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -720,7 +724,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     if (!replaying_) ++draws_;
+     const auto r = [&](uint32_t address) { return regs[address]; };
+     // Interpolation: every draw of a frame and of its replays, in order.
+-    const uint32_t draw_index = frames_per_frame_ > 1 ? begin_draw_record(regs, d) : 0;
++    if (snapshot_constants_ && !replaying_) rotate_snapshot_record(); // port/patch_snapshot_constants.py
++    const uint32_t draw_index = frames_per_frame_ > 1 || snapshot_constants_ ? begin_draw_record(regs, d) : 0;
+     const uint32_t instances = std::max<uint32_t>(d.num_instances, 1);
+ 
+     // Primitive type: Vulkan topology, or a conversion through indices.
+@@ -740,6 +745,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      case 0x05: case 0x15: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
      case 0x06: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
      case 0x13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuads; break;
@@ -627,7 +679,7 @@ index d591259..ce49055 100644
      case 0x14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuadStrip; break;
      default:
          report_once("unsupported primitive type", r(reg::VGT_PRIMITIVE_TYPE));
-@@ -762,7 +770,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -762,7 +771,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      // Render targets.
      std::array<const Target*, 8> colors{};
      uint32_t color_count = 0;
@@ -636,7 +688,16 @@ index d591259..ce49055 100644
      for (uint32_t t = 0; t < 8; ++t) {
          const uint32_t info = r(reg::CB_COLOR0_INFO + t * 4), base = r(reg::CB_COLOR0_BASE + t * 4);
          if (((target_mask >> (4 * t)) & 0xF) == 0 || ((info >> 2) & 0x3F) == 0 || base == 0) continue;
-@@ -965,7 +973,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -888,7 +897,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+ 
+     // Per-draw constants.
+     abi::DrawConstants dc{};
+-    const bool record = frames_per_frame_ > 1 && !replaying_;
++    const bool record = (frames_per_frame_ > 1 || snapshot_constants_) && !replaying_;
+     ConstantSources sources;
+     for (uint32_t i = 0; i < 16; ++i) {
+         if (const uint32_t a = r(reg::SQ_ALU_CONST_CACHE_VS_0 + i * 4)) {
+@@ -965,7 +974,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      if (replaying_) replace_constants(draw_index, dc);
      const VkDeviceSize ubo_align = std::max<VkDeviceSize>(ctx_.properties.limits.minUniformBufferOffsetAlignment, 16);
      VkDeviceSize dc_offset = 0;
@@ -646,7 +707,7 @@ index d591259..ce49055 100644
      VkDeviceSize reg_offset[2] = {};
      if (vs->info.uses_registers) {
          std::memcpy(upload(4096, ubo_align, reg_offset[0]), &regs.value[reg::SQ_ALU_CONSTANT0_256 >> 2], 4096);
-@@ -1069,6 +1078,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1069,6 +1079,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          }
      }
  
@@ -663,7 +724,7 @@ index d591259..ce49055 100644
      // Stream-out data a run of stream-out draws wrote, read by the draws
      // after it (skinned vertices, text): a barrier first, outside the pass.
      const bool writes_stream_out = stream_out && !replaying_;
-@@ -1186,7 +1205,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1186,7 +1206,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      }
      viewport.minDepth = std::clamp(viewport.minDepth, 0.0f, 1.0f);
      viewport.maxDepth = std::clamp(viewport.maxDepth, 0.0f, 1.0f);
@@ -677,7 +738,7 @@ index d591259..ce49055 100644
      vkCmdSetViewport(c, 0, 1, &viewport);
      const uint32_t tl = r(reg::PA_SC_GENERIC_SCISSOR_TL), br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4);
      const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
-@@ -1285,6 +1309,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1285,6 +1310,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          std::fprintf(stderr, "trace:   spi_ps_in 0x%08X 0x%08X interp 0x%08X vs_out_cntl 0x%08X point 0x%08X\n",
                       r(reg::SPI_PS_IN_CONTROL_0), r(reg::SPI_PS_IN_CONTROL_0 + 4), r(reg::SPI_INTERP_CONTROL_0),
                       r(reg::PA_CL_VS_OUT_CNTL), r(reg::PA_SU_POINT_SIZE));
@@ -711,7 +772,7 @@ index d591259..ce49055 100644
          if (color_count == 0) {
              std::fprintf(stderr, "trace:   no color target: mask 0x%08X cb0 base 0x%08X size 0x%08X info 0x%08X control 0x%08X\n",
                           target_mask, r(reg::CB_COLOR0_BASE), r(reg::CB_COLOR0_SIZE), r(reg::CB_COLOR0_INFO),
-@@ -1302,6 +1353,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1302,6 +1354,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                           depth->address, depth->format, depth->pitch, depth->height, depth_control,
                           r(reg::DB_STENCILREFMASK), r(reg::DB_STENCILREFMASK_BF), mode);
          }
@@ -723,7 +784,7 @@ index d591259..ce49055 100644
          const auto trace_textures = [&](const ShaderModule* s, uint32_t base, const char* stage) {
              for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
                  if (!(s->info.texture_mask & (1u << slot))) continue;
-@@ -1313,6 +1369,17 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1313,6 +1370,17 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                               (w[1] & 0x1FFF) + 1, ((w[1] >> 13) & 0x1FFF) + 1, w[0] & 7, (w[0] >> 3) & 0xF,
                               ((w[0] >> 8) & 0x7FF) * 8 + 8, (w[5] & 0xF) + 1, (w[4] >> 16) & 0xFFF,
                               t && t->source ? "(render target)" : "(memory)");
@@ -741,7 +802,7 @@ index d591259..ce49055 100644
              }
          };
          trace_textures(vs, resource::kVsTexture, "vs");
-@@ -1325,7 +1392,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1325,7 +1393,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          vkCmdBindIndexBuffer(c, ring_.buffer(), index_offset, VK_INDEX_TYPE_UINT32);
          vkCmdDrawIndexed(c, index_count, instances, 0, 0, 0);
      } else {
@@ -765,6 +826,42 @@ index 9911027..86300a5 100644
      g_rgba16_snorm = supported(physical, VK_FORMAT_R16G16B16A16_SNORM,
                                 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+diff --git a/runtime/src/gpu/vulkan/interpolate.cpp b/runtime/src/gpu/vulkan/interpolate.cpp
+index 622a213..bb1bbf9 100644
+--- a/runtime/src/gpu/vulkan/interpolate.cpp
++++ b/runtime/src/gpu/vulkan/interpolate.cpp
+@@ -201,7 +201,11 @@ void Renderer::init_interpolation() {
+     // presented as soon as they finish, without vsync.
+     uncapped_ = fps >= host::display::kUncapped;
+     frames_per_frame_ = std::clamp((fps + 30) / 60, 1u, 4u);
+-    if (frames_per_frame_ > 1) {
++    {
++        const char* v = std::getenv("TTT2_SNAPSHOT_CONSTANTS");
++        snapshot_constants_ = frames_per_frame_ == 1 && (v == nullptr || *v != '0'); // port/patch_snapshot_constants.py
++    }
++    if (frames_per_frame_ > 1 || snapshot_constants_) {
+         for (FrameRecord& f : frame_records_) {
+             // Cached: the CPU reads it back to match and blend frames
+             // (write-combined memory reads slowly).
+@@ -295,6 +299,18 @@ abi::Buffer descriptor(VkDeviceAddress a, uint32_t size, uint32_t stride) {
+ }
+ } // namespace
+ 
++// port/patch_snapshot_constants.py: at one frame per frame the two records alternate per frame; the one about
++// to be reused is waited for (the GPU work of the frame before last).
++void Renderer::rotate_snapshot_record() {
++    if (snapshot_frame_ == frame_number_) return;
++    snapshot_frame_ = frame_number_;
++    record_value_[current_record_] = submitted_ + 1;
++    current_record_ ^= 1;
++    if (record_value_[current_record_] > submitted_) submit(false);
++    wait_value(record_value_[current_record_]);
++    frame_records_[current_record_].clear();
++}
++
+ void Renderer::record_constants(uint32_t draw_index, const ConstantSources& sources, abi::DrawConstants& dc) {
+     FrameRecord& f = frame_records_[current_record_];
+     if (draw_index >= f.draws.size()) return;
 diff --git a/runtime/src/gpu/vulkan/renderer.cpp b/runtime/src/gpu/vulkan/renderer.cpp
 index c70b525..645b4a3 100644
 --- a/runtime/src/gpu/vulkan/renderer.cpp
@@ -875,7 +972,7 @@ index c70b525..645b4a3 100644
              uint16_t h[4];
              std::memcpy(h, t, 8);
 diff --git a/runtime/src/gpu/vulkan/renderer.h b/runtime/src/gpu/vulkan/renderer.h
-index 6739e5d..be793b4 100644
+index 6739e5d..ba9dee8 100644
 --- a/runtime/src/gpu/vulkan/renderer.h
 +++ b/runtime/src/gpu/vulkan/renderer.h
 @@ -244,6 +244,7 @@ private:
@@ -886,6 +983,17 @@ index 6739e5d..be793b4 100644
      };
      std::vector<Target*> write_back_targets_; // written since the last submission
      std::mutex write_back_mutex_;             // the members below: the retirement thread uses them too
+@@ -339,6 +340,10 @@ private:
+     void record_constants(uint32_t draw_index, const ConstantSources& sources, latte::abi::DrawConstants& dc);
+     void replace_constants(uint32_t draw_index, latte::abi::DrawConstants& dc);
+     uint32_t frames_per_frame_ = 1; // frames shown per frame the title renders
++    // port/patch_snapshot_constants.py: uniform blocks copied at record time with one frame per frame too.
++    bool snapshot_constants_ = false;
++    uint64_t snapshot_frame_ = ~0ull;
++    void rotate_snapshot_record();
+     bool uncapped_ = false;         // as many of those as the GPU keeps up with, presented without pacing or vsync
+     bool replaying_ = false;
+     bool replayed_ = false; // this frame's extra frames were rendered
 diff --git a/runtime/src/gpu/vulkan/targets.cpp b/runtime/src/gpu/vulkan/targets.cpp
 index 5bd50e6..00772b5 100644
 --- a/runtime/src/gpu/vulkan/targets.cpp
