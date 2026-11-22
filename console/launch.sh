@@ -18,6 +18,12 @@ mkdir -p "$BASE/save" /userdata/system/logs
 # Scale 1 = the Wii U's own 1280x720: the runtime's default on a 1080p screen is 2560x1440, which the console's
 # Vega 6 cannot fill (1.6 pictures a second, measured 19 November).
 export TTT2_SCALE=1
+# The console language the games see (runtime: port/patch_language.py): Batocera's system.language (de_DE, fr_FR, ...),
+# German when it is not set. CAFE_LANGUAGE given from outside wins.
+if [ -z "$CAFE_LANGUAGE" ]; then
+  CAFE_LANGUAGE=$(batocera-settings-get system.language 2>/dev/null)
+  export CAFE_LANGUAGE=${CAFE_LANGUAGE:-de}
+fi
 # After this game is ended with the hotkey (Alt+F4 from Batocera's virtual "batocera hotkeys" keyboard), the display
 # server keeps Alt and F4 as held down on that keyboard, and every game started afterwards closes after 3 s
 # (seen 19 November, three times; why the release is lost is NOT found). Until it is: a held key on that

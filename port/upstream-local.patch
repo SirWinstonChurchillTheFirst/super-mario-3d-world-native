@@ -593,10 +593,18 @@ index 7c1b5ee..bb0ac5a 100644
  uint32_t swap_interval();
  
 diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
-index d591259..f9ef03a 100644
+index d591259..ce49055 100644
 --- a/runtime/src/gpu/vulkan/draw.cpp
 +++ b/runtime/src/gpu/vulkan/draw.cpp
-@@ -500,7 +500,10 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+@@ -2,6 +2,7 @@
+ // per-draw constants and resources, index conversion, and the draw.
+ 
+ #include "gpu/vulkan/renderer.h"
++#include "cafe/guest.h"
+ 
+ #include "gpu/latte.h"
+ #include "gx2/types.h"
+@@ -500,7 +501,10 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
      const uint32_t color_control = regs[reg::CB_COLOR_CONTROL];
      const uint32_t blend_enable = (color_control >> 8) & 0xFF;
      const bool per_mrt = (color_control >> 7) & 1;
@@ -608,7 +616,7 @@ index d591259..f9ef03a 100644
      for (uint32_t i = 0; i < color_count; ++i) {
          k.colors[i] = colors[i];
          if (colors[i] == VK_FORMAT_UNDEFINED) continue;
-@@ -740,6 +743,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -740,6 +744,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      case 0x05: case 0x15: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
      case 0x06: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
      case 0x13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuads; break;
@@ -619,7 +627,7 @@ index d591259..f9ef03a 100644
      case 0x14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuadStrip; break;
      default:
          report_once("unsupported primitive type", r(reg::VGT_PRIMITIVE_TYPE));
-@@ -762,7 +769,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -762,7 +770,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      // Render targets.
      std::array<const Target*, 8> colors{};
      uint32_t color_count = 0;
@@ -628,7 +636,7 @@ index d591259..f9ef03a 100644
      for (uint32_t t = 0; t < 8; ++t) {
          const uint32_t info = r(reg::CB_COLOR0_INFO + t * 4), base = r(reg::CB_COLOR0_BASE + t * 4);
          if (((target_mask >> (4 * t)) & 0xF) == 0 || ((info >> 2) & 0x3F) == 0 || base == 0) continue;
-@@ -965,7 +972,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -965,7 +973,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      if (replaying_) replace_constants(draw_index, dc);
      const VkDeviceSize ubo_align = std::max<VkDeviceSize>(ctx_.properties.limits.minUniformBufferOffsetAlignment, 16);
      VkDeviceSize dc_offset = 0;
@@ -638,7 +646,7 @@ index d591259..f9ef03a 100644
      VkDeviceSize reg_offset[2] = {};
      if (vs->info.uses_registers) {
          std::memcpy(upload(4096, ubo_align, reg_offset[0]), &regs.value[reg::SQ_ALU_CONSTANT0_256 >> 2], 4096);
-@@ -1069,6 +1077,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1069,6 +1078,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          }
      }
  
@@ -655,7 +663,7 @@ index d591259..f9ef03a 100644
      // Stream-out data a run of stream-out draws wrote, read by the draws
      // after it (skinned vertices, text): a barrier first, outside the pass.
      const bool writes_stream_out = stream_out && !replaying_;
-@@ -1186,7 +1204,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1186,7 +1205,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      }
      viewport.minDepth = std::clamp(viewport.minDepth, 0.0f, 1.0f);
      viewport.maxDepth = std::clamp(viewport.maxDepth, 0.0f, 1.0f);
@@ -669,7 +677,71 @@ index d591259..f9ef03a 100644
      vkCmdSetViewport(c, 0, 1, &viewport);
      const uint32_t tl = r(reg::PA_SC_GENERIC_SCISSOR_TL), br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4);
      const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
-@@ -1325,7 +1348,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1285,6 +1309,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+         std::fprintf(stderr, "trace:   spi_ps_in 0x%08X 0x%08X interp 0x%08X vs_out_cntl 0x%08X point 0x%08X\n",
+                      r(reg::SPI_PS_IN_CONTROL_0), r(reg::SPI_PS_IN_CONTROL_0 + 4), r(reg::SPI_INTERP_CONTROL_0),
+                      r(reg::PA_CL_VS_OUT_CNTL), r(reg::PA_SU_POINT_SIZE));
++        // (19 Nov, looking for the turned picture in Mario Tennis:) a rectangle list's three vertices as the first
++        // vertex buffer holds them (four big-endian floats each) and the first two vectors of constant block 1.
++        if (r(reg::VGT_PRIMITIVE_TYPE) == 0x11 && !indexed) {
++            const uint32_t vbase = kResourceBase + resource::kVsAttrib * resource::kWords * 4;
++            const uint32_t va = r(vbase), stride = (r(vbase + 8) >> 8) & 0x7FF;
++            const auto be_float = [](uint32_t address) {
++                uint32_t w;
++                std::memcpy(&w, cafe::guest<uint8_t>(address), 4);
++                w = __builtin_bswap32(w);
++                float f;
++                std::memcpy(&f, &w, 4);
++                return static_cast<double>(f);
++            };
++            for (uint32_t v = 0; v < 3 && va != 0 && stride >= 16; ++v) {
++                const uint32_t a = va + v * stride;
++                std::fprintf(stderr, "trace:   rect v%u (0x%08X stride %u): %g %g | %g %g\n", v, a, stride, be_float(a),
++                             be_float(a + 4), be_float(a + 8), be_float(a + 12));
++            }
++            if (const uint32_t cb = r(reg::SQ_ALU_CONST_CACHE_VS_0 + 4) << 8) {
++                float k[8];
++                std::memcpy(k, cafe::guest<uint8_t>(cb), sizeof(k));
++                std::fprintf(stderr, "trace:   rect constants: %g %g %g %g | %g %g %g %g\n", static_cast<double>(k[0]),
++                             static_cast<double>(k[1]), static_cast<double>(k[2]), static_cast<double>(k[3]),
++                             static_cast<double>(k[4]), static_cast<double>(k[5]), static_cast<double>(k[6]),
++                             static_cast<double>(k[7]));
++            }
++        }
+         if (color_count == 0) {
+             std::fprintf(stderr, "trace:   no color target: mask 0x%08X cb0 base 0x%08X size 0x%08X info 0x%08X control 0x%08X\n",
+                          target_mask, r(reg::CB_COLOR0_BASE), r(reg::CB_COLOR0_SIZE), r(reg::CB_COLOR0_INFO),
+@@ -1302,6 +1353,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+                          depth->address, depth->format, depth->pitch, depth->height, depth_control,
+                          r(reg::DB_STENCILREFMASK), r(reg::DB_STENCILREFMASK_BF), mode);
+         }
++        static uint64_t traced_frame = UINT64_MAX;
++        static uint32_t traced_draw_n = 0;
++        if (traced_frame != frame_number_) { traced_frame = frame_number_; traced_draw_n = 0; }
++        ++traced_draw_n;
++        std::fprintf(stderr, "trace:   (draw number %u of the traced frame)\n", traced_draw_n);
+         const auto trace_textures = [&](const ShaderModule* s, uint32_t base, const char* stage) {
+             for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
+                 if (!(s->info.texture_mask & (1u << slot))) continue;
+@@ -1313,6 +1369,17 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+                              (w[1] & 0x1FFF) + 1, ((w[1] >> 13) & 0x1FFF) + 1, w[0] & 7, (w[0] >> 3) & 0xF,
+                              ((w[0] >> 8) & 0x7FF) * 8 + 8, (w[5] & 0xF) + 1, (w[4] >> 16) & 0xFFF,
+                              t && t->source ? "(render target)" : "(memory)");
++                // TTT2_TRACE_TEX=n: the textures of the traced frame's draw n, as PNGs in TTT2_CAPTURE (debugging).
++                static const char* tex_draw = std::getenv("TTT2_TRACE_TEX");
++                static const char* tex_dir = std::getenv("TTT2_CAPTURE");
++                if (t && tex_draw && tex_dir && (traced_draw_n == std::strtoul(tex_draw, nullptr, 10) || (tex_draw[0] == 0x70 && std::strtoull(tex_draw + 1, nullptr, 16) == static_cast<unsigned long long>(ph)))) {
++                    char name[64];
++                    std::snprintf(name, sizeof(name), "/tex_%s%u_%ux%u.png", stage, slot, t->image.width, t->image.height);
++                    end_rendering();
++                    save_image(t->image, std::string(tex_dir) + name);
++                    std::fprintf(stderr, "trace:   saved %s: image %ux%u, source %p\n", name, t->image.width, t->image.height,
++                                 static_cast<const void*>(t->source));
++                }
+             }
+         };
+         trace_textures(vs, resource::kVsTexture, "vs");
+@@ -1325,7 +1392,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          vkCmdBindIndexBuffer(c, ring_.buffer(), index_offset, VK_INDEX_TYPE_UINT32);
          vkCmdDrawIndexed(c, index_count, instances, 0, 0, 0);
      } else {
@@ -694,7 +766,7 @@ index 9911027..86300a5 100644
                                 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
 diff --git a/runtime/src/gpu/vulkan/renderer.cpp b/runtime/src/gpu/vulkan/renderer.cpp
-index c70b525..15a5192 100644
+index c70b525..645b4a3 100644
 --- a/runtime/src/gpu/vulkan/renderer.cpp
 +++ b/runtime/src/gpu/vulkan/renderer.cpp
 @@ -40,6 +40,13 @@ void set_tv_height(uint32_t rows) {
@@ -765,6 +837,43 @@ index c70b525..15a5192 100644
      barrier();
      scan_valid_[index] = true;
      profile_mark("copy to scan buffer", t->address, width, height);
+@@ -377,12 +414,13 @@ void Renderer::save_image(const Image& img, const std::string& path, bool keep_a
+     // Formats a trace can show: 8-bit, signed 8-bit, 10-bit, half float and
+     // depth, decoded to RGBA in [0, 1] (signed and HDR values clamped; the
+     // stats line has the real mean and peak).
+-    enum class Kind { kRgba, kBgra, kSnorm, kSnorm16, kRgb10, kHalf, kRg16, kDepth16, kDepth } kind;
++    enum class Kind { kRgba, kBgra, kSnorm, kSnorm16, kRgb10, kR11, kHalf, kRg16, kDepth16, kDepth } kind;
+     switch (img.format) {
+     case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: kind = Kind::kRgba; break;
+     case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: kind = Kind::kBgra; break;
+     case VK_FORMAT_R8G8B8A8_SNORM: kind = Kind::kSnorm; break;
+     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: kind = Kind::kRgb10; break;
++    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: kind = Kind::kR11; break; // (debugging, 19 Nov)
+     case VK_FORMAT_R16G16B16A16_SFLOAT: kind = Kind::kHalf; break;
+     case VK_FORMAT_R16G16_UNORM: kind = Kind::kRg16; break;
+     case VK_FORMAT_R16G16B16A16_SNORM: kind = Kind::kSnorm16; break;
+@@ -429,6 +467,21 @@ void Renderer::save_image(const Image& img, const std::string& path, bool keep_a
+             c[3] = (w >> 30) / 3.0f;
+             break;
+         }
++        case Kind::kR11: { // 11/11/10-bit floats without sign: 5 exponent bits, 6 or 5 mantissa bits
++            uint32_t w;
++            std::memcpy(&w, t, 4);
++            const auto small = [](uint32_t v, int mbits) {
++                const uint32_t e = v >> mbits, m = v & ((1u << mbits) - 1);
++                if (e == 0) return std::ldexp(static_cast<float>(m), -14 - mbits);
++                if (e == 31) return 65504.0f;
++                return std::ldexp(static_cast<float>(m | (1u << mbits)), static_cast<int>(e) - 15 - mbits);
++            };
++            c[0] = small(w & 0x7FF, 6);
++            c[1] = small((w >> 11) & 0x7FF, 6);
++            c[2] = small(w >> 22, 5);
++            c[3] = 1.0f;
++            break;
++        }
+         case Kind::kHalf: {
+             uint16_t h[4];
+             std::memcpy(h, t, 8);
 diff --git a/runtime/src/gpu/vulkan/renderer.h b/runtime/src/gpu/vulkan/renderer.h
 index 6739e5d..be793b4 100644
 --- a/runtime/src/gpu/vulkan/renderer.h
@@ -778,7 +887,7 @@ index 6739e5d..be793b4 100644
      std::vector<Target*> write_back_targets_; // written since the last submission
      std::mutex write_back_mutex_;             // the members below: the retirement thread uses them too
 diff --git a/runtime/src/gpu/vulkan/targets.cpp b/runtime/src/gpu/vulkan/targets.cpp
-index 5bd50e6..10d662f 100644
+index 5bd50e6..00772b5 100644
 --- a/runtime/src/gpu/vulkan/targets.cpp
 +++ b/runtime/src/gpu/vulkan/targets.cpp
 @@ -10,7 +10,12 @@
@@ -855,16 +964,26 @@ index 5bd50e6..10d662f 100644
      if (tracing()) {
          std::fprintf(stderr, "trace: clear depth 0x%08X fmt 0x%03X %ux%u flags %u (%g, %u)\n", t->address, t->format,
                       t->pitch, t->height, flags, depth, stencil);
-@@ -420,6 +468,8 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
+@@ -420,6 +468,18 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
  // ------------------------------------------------------------ write-back
  
  void Renderer::queue_write_back(Target* t) {
 +    static const bool none = std::getenv("TTT2_NO_WRITEBACK") != nullptr; // port/patch_writeback_guard.py
 +    if (none) return;
++    static const auto range = [] { // TTT2_WRITEBACK_RANGE=lo-hi (hex): only targets in it (test switch)
++        std::pair<uint32_t, uint32_t> r{0u, 0xFFFFFFFFu};
++        if (const char* v = std::getenv("TTT2_WRITEBACK_RANGE")) {
++            char* end = nullptr;
++            r.first = static_cast<uint32_t>(std::strtoul(v, &end, 16));
++            if (end && *end == '-') r.second = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16));
++        }
++        return r;
++    }();
++    if (t->address < range.first || t->address > range.second) return;
      if (!t->write_back || replaying_ || t->write_back_queued) return;
      t->write_back_queued = true;
      write_back_targets_.push_back(t);
-@@ -438,9 +488,20 @@ void Renderer::copy_write_backs() {
+@@ -438,9 +498,20 @@ void Renderer::copy_write_backs() {
          if (!guest_memory_committed(t->address, t->pitch * t->height * bytes)) continue;
          if (write_back_free_.empty()) {
              write_back_free_.push_back(static_cast<uint32_t>(write_back_staging_.size()));
@@ -888,7 +1007,7 @@ index 5bd50e6..10d662f 100644
          }
          const uint32_t staging = write_back_free_.back();
          write_back_free_.pop_back();
-@@ -449,7 +510,21 @@ void Renderer::copy_write_backs() {
+@@ -449,7 +520,21 @@ void Renderer::copy_write_backs() {
          region.imageExtent = {t->pitch, t->height, 1};
          vkCmdCopyImageToBuffer(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, write_back_staging_[staging].buffer, 1,
                                 &region);
@@ -911,7 +1030,7 @@ index 5bd50e6..10d662f 100644
          if (tracing()) {
              std::fprintf(stderr, "trace: write back 0x%08X fmt 0x%03X %ux%u tile %u\n", t->address, t->format, t->pitch,
                           t->height, t->tile_mode);
-@@ -472,6 +547,19 @@ void Renderer::copy_write_backs() {
+@@ -472,6 +557,19 @@ void Renderer::copy_write_backs() {
  // (Retirement thread.) The copies of the submissions up to `value`, tiled
  // into guest memory.
  void Renderer::retired(uint64_t value) {
@@ -931,7 +1050,7 @@ index 5bd50e6..10d662f 100644
      for (;;) {
          WriteBack w;
          const uint8_t* data;
-@@ -482,6 +570,19 @@ void Renderer::retired(uint64_t value) {
+@@ -482,6 +580,19 @@ void Renderer::retired(uint64_t value) {
              write_backs_.pop_front();
              data = write_back_staging_[w.staging].mapped;
          }
@@ -951,7 +1070,7 @@ index 5bd50e6..10d662f 100644
          TiledLevel level{};
          level.data = guest_pointer(w.address);
          level.base256b = w.base_reg;
-@@ -492,8 +593,15 @@ void Renderer::retired(uint64_t value) {
+@@ -492,8 +603,15 @@ void Renderer::retired(uint64_t value) {
          level.slices = 1;
          level.samples = 1;
          tile(level, w.pitch, w.height, 0, 1, data);
@@ -1668,6 +1787,99 @@ index a3de794..be75f9c 100644
      bool interrupts_disabled = false;
      int core = 1;
      std::jmp_buf exit_jump{};
+diff --git a/runtime/src/os/system_config.cpp b/runtime/src/os/system_config.cpp
+index 852f5d4..d68e479 100644
+--- a/runtime/src/os/system_config.cpp
++++ b/runtime/src/os/system_config.cpp
+@@ -6,9 +6,15 @@
+ 
+ #include "cafe/export.h"
+ 
++#include <cctype>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <string>
+ #include <string_view>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ 
+ namespace cafe::os {
+ namespace {
+@@ -17,6 +23,57 @@ constexpr uint8_t kRegionEurope = 4;
+ constexpr uint32_t kLanguageEnglish = 1;
+ constexpr uint32_t kCountryUnitedKingdom = 110;
+ 
++// port/patch_language.py: the language (Wii U numbering) and its country, from CAFE_LANGUAGE or the host locale.
++struct LanguageChoice { uint32_t language, country; };
++LanguageChoice choose_language() {
++    struct Entry { const char* code; uint32_t language, country; };
++    // Wii U: 0 ja, 1 en, 2 fr, 3 de, 4 it, 5 es, 6 zh, 7 ko, 8 nl, 9 pt, 10 ru, 11 tw; countries as the Wii's codes.
++    static constexpr Entry kTable[] = {{"ja", 0, 1},  {"en", 1, kCountryUnitedKingdom}, {"fr", 2, 77}, {"de", 3, 78},
++                                       {"it", 4, 83}, {"es", 5, 105}, {"zh", 6, 160}, {"ko", 7, 136},
++                                       {"nl", 8, 94}, {"pt", 9, 99}, {"ru", 10, 100}, {"tw", 11, 128}};
++    std::string wanted;
++    const char* source = "default";
++    if (const char* v = std::getenv("CAFE_LANGUAGE"); v && *v) {
++        wanted = v;
++        source = "CAFE_LANGUAGE";
++    } else {
++#ifdef _WIN32
++        wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
++        if (GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH) > 0) {
++            for (const wchar_t* c = name; *c && *c != L'-'; ++c) wanted += static_cast<char>(*c);
++            source = "the user locale";
++        }
++#else
++        for (const char* var : {"LC_ALL", "LC_MESSAGES", "LANG"}) {
++            const char* v = std::getenv(var);
++            if (v && *v && std::strcmp(v, "C") != 0 && std::strcmp(v, "POSIX") != 0) {
++                wanted = v;
++                source = var;
++                break;
++            }
++        }
++#endif
++    }
++    for (char& c : wanted) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    LanguageChoice choice{kLanguageEnglish, kCountryUnitedKingdom};
++    if (!wanted.empty() && std::isdigit(static_cast<unsigned char>(wanted[0]))) {
++        const uint32_t n = static_cast<uint32_t>(std::atoi(wanted.c_str()));
++        for (const Entry& e : kTable) if (e.language == n) choice = {e.language, e.country};
++    } else if (wanted.rfind("german", 0) == 0) {
++        choice = {3, 78};
++    } else if (wanted.size() >= 2) {
++        const std::string code = wanted == "zh_tw" || wanted.rfind("zh_tw", 0) == 0 ? "tw" : wanted.substr(0, 2);
++        for (const Entry& e : kTable) if (code == e.code) choice = {e.language, e.country};
++    }
++    std::fprintf(stderr, "ttt2: system language %u, country %u (from %s%s%s)\n", choice.language, choice.country, source,
++                 wanted.empty() ? "" : " = ", wanted.c_str());
++    return choice;
++}
++const LanguageChoice& language_choice() {
++    static const LanguageChoice choice = choose_language();
++    return choice;
++}
++
+ // MCP ---------------------------------------------------------------------
+ uint32_t MCP_Open() { return 1; }
+ void MCP_Close(uint32_t) {}
+@@ -46,6 +103,14 @@ int32_t UCOpen() { return 1; }
+ int32_t UCClose(int32_t) { return 0; }
+ 
+ bool lookup(std::string_view name, uint32_t& value) {
++    if (name == "cafe.language") {
++        value = language_choice().language;
++        return true;
++    }
++    if (name == "cafe.cntry_reg") {
++        value = language_choice().country;
++        return true;
++    }
+     struct Setting { std::string_view name; uint32_t value; };
+     static constexpr Setting kSettings[] = {
+         {"cafe.language", kLanguageEnglish},
 diff --git a/runtime/src/os/thread.cpp b/runtime/src/os/thread.cpp
 index 903c088..ac89d12 100644
 --- a/runtime/src/os/thread.cpp
