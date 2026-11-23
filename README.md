@@ -65,6 +65,25 @@ own `CafeStd.ttf` there to replace it. Saves go to `play/save/`. The system lang
 
 **Getestet / tested (23 Nov 2026):** For this game the Windows setup's translation step was run on the tested dump: it gives the same code as the build that runs on the Batocera console (only the newer recompiler's `dcbf` lines differ); the complete build of this game through the scripts was not run yet. The same scripts were run end to end from an empty folder on 23 November 2026: Lost Levels and Mario Kart 8 on Windows 11, Lost Levels on Ubuntu 26.04 and on a fresh Ubuntu 24.04 (SDL3 built from source there), Mario Party 10 on Windows 11.
 
+## Update 23 November 2026: a real Wii Remote is a Wii Remote
+
+Before, a Wii Remote (Linux kernel driver hid-wiimote) reached the game only through SDL as a "GamePad" with the
+console menu's upright mapping: its A arrived as the Wii U's B, B as A, 1 and 2 as ZL and ZR (measured with a
+stand-in remote on the console, `tools/ctl/vwii.py` + `tools/ctl/ctlrun.sh`, and the runtime's `TTT2_INPUT_RECORD`).
+
+Now `CAFE_WIIMOTE=real` (`port/patch_wiimote_real.py`, set in `console/game-env/3dworld.env`) makes the runtime read
+real Wii Remotes itself (buttons, accelerometer, pointer, Nunchuk) and hand them to the game as Wii Remotes on the
+KPAD channels, while every other controller stays GamePad / Pro Controller. Checked on the console with the stand-in
+remote: the game's controller screen shows the remote, button 2 joins and confirms, the opening plays (58 to 60
+frames/s). The game drops all remotes at its title screen, as on the Wii U: the first button press connects the
+remote again. Not checked with a real remote in the hand: tilt, shake, pointer.
+
+Also fixed on the way: `KPADReadEx` on an empty channel now reports "no controller" (-2); it reported "no new
+samples" (-1), and the game's controller library took all four channels for connected remotes.
+
+`console/launch.sh` gives a remote that the runtime does not read (GamePad-only games, or no direct access) a sideways
+mapping instead of the menu's upright one (`console/padfix.py --profil=quer-ab|quer|quer-kart`).
+
 ## Update 22 November 2026, afternoon: brightness as on the console
 
 The picture was much too dark. The game declares its TV and GamePad scan buffers as sRGB (format 0x41A) but renders linear values into a 10-bit UNORM colour buffer; the console's copy into the scan buffer encodes them, and Cemu does the same. The runtime copied the bytes unchanged. Now the copy converts when the declared kind and the colour buffer's kind differ (`port/patch_scan_srgb.py`; `TTT2_SCAN_RAW=1` gives the old copy). Measured on the same title-screen shot: mean brightness 132 before, 177 after, Cemu 177 (0-255). Both presentation paths were checked to show the scan buffer unchanged (`tools/console_bright.sh`).
@@ -84,7 +103,8 @@ Tested on one PC (Windows 11, GeForce RTX 3070 Ti, 1280x720), with scripted butt
 | Sound | present in a recording of the output (not listened to). Reverb, chorus and delay are not computed |
 | Speed | 59 to 60 frames/s without picture captures (title and opening measured that way), single late pictures of 15 to 70 ms at scene changes; the renderer needs 1.5 to 4 ms per frame on that card. Each picture capture of the test tools costs about 0.1 s, so captured runs show 56 to 58 |
 | Saving and loading | **not tested**: the game saves when a level is finished, and the script does not finish one |
-| Controller, GamePad screen, everything after World 1-1 | **not tested** |
+| Wii Remote (stand-in device on the console) | recognised as a Wii Remote, button 2 joins and starts the game; real remote, tilt and shake **not tested** |
+| GamePad screen, everything after World 1-1 | **not tested** |
 | Linux program on a small AMD box (Batocera, Ryzen 3 PRO 4350GE, Vega 6, 1080p TV) | **runs at 59 to 60 frames/s** (22 November): installed with `console/deploy.sh`, started through the menu, World 1-1 reached by script, picture right, the game's sound stream plays (not listened to). It held 30 before: the title waits every frame for a GPU timestamp, and the runtime only lets one retire after it has copied the small render targets back into guest memory. Those copies were read from uncached (write-combined) memory on this APU: 140 KB took 8.4 ms a frame. With cached staging memory (`port/patch_writeback_cached.py`) they take 0.15 to 0.3 ms and the title waits 9 ms instead of 18 (measured with `TTT2_WAIT_LOG=1`, `port/patch_waitlog.py`). Also needed earlier: `TTT2_SCALE=1` (set by `console/launch.sh`) and `port/patch_night4.py`. The held Alt+F4 after quitting is now released by the console's menu program before and after every game (cause: Batocera's `hotkeygen --send exit` removes its short-lived keyboard right after the release, which can be lost); `launch.sh` still checks too |
 
 Known gaps: Mii data files of the console (`FFLRes*.dat`) are not part of a game dump and are missing; occlusion

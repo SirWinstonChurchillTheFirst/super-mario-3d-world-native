@@ -303,7 +303,7 @@ index e257ea8..392c34e 100644
  }
  
 diff --git a/runtime/include/cafe/input.h b/runtime/include/cafe/input.h
-index 96b6a3a..7d29a67 100644
+index 96b6a3a..b47b5f9 100644
 --- a/runtime/include/cafe/input.h
 +++ b/runtime/include/cafe/input.h
 @@ -20,6 +20,8 @@ struct GamepadState {
@@ -315,7 +315,7 @@ index 96b6a3a..7d29a67 100644
  };
  
  void set_gamepad_state(const GamepadState& state);
-@@ -40,6 +42,34 @@ struct ProPadState {
+@@ -40,6 +42,36 @@ struct ProPadState {
  };
  
  void set_pro_pad_state(int channel, const ProPadState& state);
@@ -346,6 +346,8 @@ index 96b6a3a..7d29a67 100644
 +};
 +
 +bool wiimote_mode(); // CAFE_WIIMOTE=1
++// port/patch_wiimote_real.py: CAFE_WIIMOTE=real - only real Wii Remotes are Wii Remotes, other pads stay pads
++bool wiimote_real_mode();
 +void set_wiimote_state(int channel, const WiimoteState& state);
  // The title set a Pro Controller/Wii Remote connect callback: extra host pads become its controllers.
  bool pro_controllers_in_use();
@@ -2817,7 +2819,7 @@ index e403aff..4cde864 100644
  CAFE_EXPORT(gx2, GX2ExpandDepthBuffer, GX2ExpandDepthBuffer);
  CAFE_EXPORT(gx2, GX2ConvertDepthBufferToTextureSurface, GX2ConvertDepthBufferToTextureSurface);
 diff --git a/runtime/src/host/window.cpp b/runtime/src/host/window.cpp
-index 7d7dddc..1fa0fcf 100644
+index 7d7dddc..749fef7 100644
 --- a/runtime/src/host/window.cpp
 +++ b/runtime/src/host/window.cpp
 @@ -10,6 +10,15 @@
@@ -2862,7 +2864,7 @@ index 7d7dddc..1fa0fcf 100644
  OverlayHooks g_overlay;
  std::atomic<bool> g_quit_requested{false};
  
-@@ -282,13 +310,324 @@ void update_virtual_pads() {
+@@ -282,19 +310,362 @@ void update_virtual_pads() {
      }
  }
  
@@ -3145,8 +3147,7 @@ index 7d7dddc..1fa0fcf 100644
 +    std::array<os::WiimoteState, os::wiimote::kChannels> states{};
 +    int channel = 0;
 +#ifdef __linux__
-+    read_real_remotes();
-+    for (const RealRemote& r : g_real_remotes) {
++    for (const RealRemote& r : g_real_remotes) { // read in update_input (port/patch_wiimote_real.py)
 +        if (channel < os::wiimote::kChannels && r.state.connected) states[channel++] = r.state;
 +    }
 +#endif
@@ -3175,10 +3176,43 @@ index 7d7dddc..1fa0fcf 100644
      os::GamepadState state{};
 -    const bool pros = os::pro_controllers_in_use();
 +    const bool wiimotes = os::wiimote_mode(); // port/patch_wiimote.py
++    const bool real_only = os::wiimote_real_mode(); // port/patch_wiimote_real.py
 +    const bool pros = os::pro_controllers_in_use() && !wiimotes;
      int count = 0;
      SDL_JoystickID* ids = SDL_GetGamepads(&count);
 -    if (pros) assign_pad_slots(ids, count);
++    int real = 0; // Wii Remotes on the first KPAD channels in the real-only mode
++    std::array<os::WiimoteState, os::wiimote::kChannels> real_states{};
++#ifdef __linux__
++    if (wiimotes || real_only) {
++        read_real_remotes();
++        int seen = 0;
++        for (const RealRemote& r : g_real_remotes) {
++            if (!r.state.connected) continue;
++            if (real_only && real < os::wiimote::kChannels) real_states[real++] = r.state;
++            ++seen;
++        }
++        // A remote read directly is not a pad as well: its SDL device takes no slot and presses nothing.
++        int kept = 0;
++        for (int i = 0; seen > 0 && ids != nullptr && i < count; ++i) {
++            const char* name = SDL_GetGamepadNameForID(ids[i]);
++            if (name && std::strstr(name, "Wii Remote") && !std::strstr(name, "Pro Controller") &&
++                !std::strstr(name, "Classic") && !std::strstr(name, "Balance")) continue;
++            ids[kept++] = ids[i];
++        }
++        if (seen > 0 && ids != nullptr) count = kept;
++    }
++#endif
++    if (real_only) {
++        static const bool scripted = std::getenv("TTT2_INPUT_SCRIPT") != nullptr && std::getenv("TTT2_SCRIPT_REMOTE_ONLY") != nullptr;
++        if (real == 0 && scripted) { // unattended runs: remote 0 exists for the script (os/input.cpp)
++            static const char* nunchuk = std::getenv("TTT2_SCRIPT_NUNCHUK");
++            real_states[0].connected = true;
++            real_states[0].nunchuk = nunchuk == nullptr || *nunchuk != '0';
++            real = 1;
++        }
++        for (int c = 0; c < os::wiimote::kChannels; ++c) os::set_wiimote_state(c, c < real ? real_states[c] : os::WiimoteState{});
++    }
 +    if (pros || wiimotes) assign_pad_slots(ids, count);
 +    std::vector<SDL_JoystickID> as_remote;
 +    static const bool remote_drives_gamepad = [] {
@@ -3189,7 +3223,14 @@ index 7d7dddc..1fa0fcf 100644
      os::ProPadState channels[os::pro::kChannels]{};
      for (int c = 0; c < os::pro::kChannels; ++c) channels[c].connected = g_pad_slots[c + 1] != 0;
      if (g_overlay.captures && g_overlay.captures()) { // still connected, nothing pressed
-@@ -308,6 +647,9 @@ void update_input() {
+         SDL_free(ids);
+         os::set_gamepad_state(state);
+-        for (int c = 0; pros && c < os::pro::kChannels; ++c) os::set_pro_pad_state(c, channels[c]);
++        for (int c = real; pros && c < os::pro::kChannels; ++c) os::set_pro_pad_state(c, channels[c - real]);
+         return;
+     }
+     for (size_t i = 0; i < keymap::kInputCount; ++i) {
+@@ -308,6 +679,9 @@ void update_input() {
          SDL_Gamepad* pad = SDL_GetGamepadFromID(ids[i]);
          if (pad == nullptr) pad = SDL_OpenGamepad(ids[i]);
          if (pad == nullptr) continue;
@@ -3199,7 +3240,7 @@ index 7d7dddc..1fa0fcf 100644
          if (pros) {
              const auto slot = std::find(g_pad_slots.begin(), g_pad_slots.end(), ids[i]) - g_pad_slots.begin();
              if (slot >= static_cast<ptrdiff_t>(g_pad_slots.size())) continue; // a ninth pad
-@@ -327,6 +669,26 @@ void update_input() {
+@@ -327,9 +701,29 @@ void update_input() {
          state.right_y = std::clamp(state.right_y - axis(pad, SDL_GAMEPAD_AXIS_RIGHTY), -1.0f, 1.0f);
      }
      SDL_free(ids);
@@ -3225,8 +3266,12 @@ index 7d7dddc..1fa0fcf 100644
 +    }
      for (int c = 0; pros && c < os::pro::kChannels; ++c) netplay::remote_pad(c, channels[c]);
      os::set_gamepad_state(state);
-     for (int c = 0; pros && c < os::pro::kChannels; ++c) os::set_pro_pad_state(c, channels[c]);
-@@ -458,6 +820,8 @@ bool run_event_loop(const std::function<bool()>& finished) {
+-    for (int c = 0; pros && c < os::pro::kChannels; ++c) os::set_pro_pad_state(c, channels[c]);
++    for (int c = real; pros && c < os::pro::kChannels; ++c) os::set_pro_pad_state(c, channels[c - real]);
+ }
+ 
+ void update_size() {
+@@ -458,6 +852,8 @@ bool run_event_loop(const std::function<bool()>& finished) {
                  if (event.key.scancode == SDL_SCANCODE_F12 && !event.key.repeat) gpu::request_frame_trace();
                  // F10: profile the next ten seconds (profile-<n>.txt beside the executable).
                  if (event.key.scancode == SDL_SCANCODE_F10 && !event.key.repeat) os::request_profile();
@@ -3235,7 +3280,7 @@ index 7d7dddc..1fa0fcf 100644
                  break;
              case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
                  // Both sticks clicked: F12 from a pad, mid-fight.
-@@ -466,6 +830,31 @@ bool run_event_loop(const std::function<bool()>& finished) {
+@@ -466,6 +862,31 @@ bool run_event_loop(const std::function<bool()>& finished) {
                                                                                                        : SDL_GAMEPAD_BUTTON_INVALID;
                  SDL_Gamepad* pad = SDL_GetGamepadFromID(event.gbutton.which);
                  if (other != SDL_GAMEPAD_BUTTON_INVALID && pad && SDL_GetGamepadButton(pad, other)) gpu::request_frame_trace();
@@ -3267,7 +3312,7 @@ index 7d7dddc..1fa0fcf 100644
                  break;
              }
              default: break;
-@@ -479,6 +868,9 @@ bool run_event_loop(const std::function<bool()>& finished) {
+@@ -479,6 +900,9 @@ bool run_event_loop(const std::function<bool()>& finished) {
      return true;
  }
  
@@ -4604,7 +4649,7 @@ index 552bb84..d1234df 100644
  CAFE_EXPORT(coreinit, MEMFreeToAllocator, MEMFreeToAllocator);
  CAFE_DATA_EXPORT(coreinit, MEMAllocFromDefaultHeap, init_alloc_pointer);
 diff --git a/runtime/src/os/input.cpp b/runtime/src/os/input.cpp
-index a861ac3..96fd9a1 100644
+index a861ac3..05fb21e 100644
 --- a/runtime/src/os/input.cpp
 +++ b/runtime/src/os/input.cpp
 @@ -8,6 +8,8 @@
@@ -4616,7 +4661,15 @@ index a861ac3..96fd9a1 100644
  #include <array>
  #include <cstdio>
  #include <chrono>
-@@ -53,6 +55,8 @@ struct StickHold {
+@@ -22,6 +24,7 @@ namespace {
+ 
+ std::mutex g_input_mutex;
+ GamepadState g_gamepad{};
++bool g_host_input_seen = false; // port/patch_wiimote_real.py: the window's input loop runs
+ uint32_t g_previous_hold = 0;
+ 
+ // TTT2_INPUT_SCRIPT="15:plus,20.5:a,22:down" presses each button at the given
+@@ -53,6 +56,8 @@ struct StickHold {
  struct Script {
      std::vector<ScriptedPress> presses;
      std::vector<StickHold> sticks;
@@ -4625,7 +4678,7 @@ index a861ac3..96fd9a1 100644
      std::vector<uint32_t> anchors;
      std::mutex mutex;
      std::vector<double> starts; // each segment's start, after start-up; < 0 while waiting
-@@ -91,6 +95,16 @@ Script& load_script() {
+@@ -91,6 +96,16 @@ Script& load_script() {
                  std::sscanf(name.c_str() + 6, "%lf/%lf/%lf", &x, &y, &duration);
                  script.sticks.push_back({std::atof(item.substr(0, colon).c_str()), x, y, duration, script.anchors.size()});
              }
@@ -4642,7 +4695,7 @@ index a861ac3..96fd9a1 100644
              const size_t equals = name.find('=');
              for (const auto& [n, bit] : kNames) {
                  if (name.substr(0, equals) == n) {
-@@ -164,6 +178,38 @@ bool scripted_stick(float& x, float& y) {
+@@ -164,6 +179,38 @@ bool scripted_stick(float& x, float& y) {
      return false;
  }
  
@@ -4681,7 +4734,7 @@ index a861ac3..96fd9a1 100644
  // ------------------------------------------------------------ the + chord
  // See arm_start_chord. A press of + waits kChordFrames armings (the mode's
  // frames, so slow frames wait longer): the mode sees a button two or three
-@@ -327,6 +373,24 @@ struct VPADStatus {
+@@ -327,11 +374,41 @@ struct VPADStatus {
  };
  static_assert(sizeof(VPADStatus) == 0xAC);
  
@@ -4706,7 +4759,24 @@ index a861ac3..96fd9a1 100644
  void VPADInit() {}
  
  void deliver_connects();
-@@ -340,7 +404,11 @@ int32_t VPADRead(int32_t channel, VPADStatus* status, uint32_t count, be<int32_t
+ 
+ int32_t VPADRead(int32_t channel, VPADStatus* status, uint32_t count, be<int32_t>* error) {
++    { // port/patch_wiimote_real.py: headless scripted runs
++        static const bool script_remote = (wiimote_mode() || wiimote_real_mode()) && std::getenv("TTT2_INPUT_SCRIPT") != nullptr &&
++                                          std::getenv("TTT2_SCRIPT_REMOTE_ONLY") != nullptr;
++        if (script_remote && !g_host_input_seen) {
++            static const char* nunchuk = std::getenv("TTT2_SCRIPT_NUNCHUK");
++            WiimoteState w;
++            w.connected = true;
++            w.nunchuk = nunchuk == nullptr || *nunchuk != '0';
++            w.buttons = script_wiimote_buttons(g_script_vpad); // a press reconnects a remote the title dropped
++            set_wiimote_state(0, w);
++        }
++    }
+     deliver_connects();
+     if (channel != 0 || count == 0 || status == nullptr) {
+         if (error) *error = kVpadNoController;
+@@ -340,7 +417,11 @@ int32_t VPADRead(int32_t channel, VPADStatus* status, uint32_t count, be<int32_t
      std::lock_guard lock(g_input_mutex);
      std::memset(status, 0, sizeof(VPADStatus));
      const GamepadState pad = pad_for_read(g_gamepad);
@@ -4719,7 +4789,7 @@ index a861ac3..96fd9a1 100644
      status->hold = hold;
      status->trigger = hold & ~g_previous_hold;
      status->release = g_previous_hold & ~hold;
-@@ -349,6 +417,17 @@ int32_t VPADRead(int32_t channel, VPADStatus* status, uint32_t count, be<int32_t
+@@ -349,6 +430,17 @@ int32_t VPADRead(int32_t channel, VPADStatus* status, uint32_t count, be<int32_t
      scripted_stick(left_x, left_y);
      status->left_stick = {left_x, left_y};
      status->right_stick = {pad.right_x, pad.right_y};
@@ -4737,7 +4807,7 @@ index a861ac3..96fd9a1 100644
      // A GamePad lying flat and still: gravity on -Z (in g), identity frame.
      status->acceleration = {0.0f, 0.0f, -1.0f};
      status->acc_magnitude = 1.0f;
-@@ -380,6 +459,13 @@ constexpr int32_t kWpadNoController = -1;
+@@ -380,6 +472,13 @@ constexpr int32_t kWpadNoController = -1;
  constexpr uint8_t kExtProController = 0x1F, kNoDevice = 0xFD;
  
  struct ProChannel {
@@ -4751,7 +4821,7 @@ index a861ac3..96fd9a1 100644
      ProPadState host{};     // as the host has it
      bool connected = false; // as the title has it
      bool dropped = false;   // the title disconnected it
-@@ -432,6 +518,121 @@ uint32_t KPADSetConnectCallback(uint32_t channel, uint32_t callback) {
+@@ -432,14 +531,134 @@ uint32_t KPADSetConnectCallback(uint32_t channel, uint32_t callback) {
      g_pro[channel].callback = callback;
      return previous;
  }
@@ -4873,7 +4943,9 @@ index a861ac3..96fd9a1 100644
  int32_t KPADReadEx(int32_t channel, KPADStatus* status, uint32_t count, be<int32_t>* error) {
      std::lock_guard lock(g_input_mutex);
      if (channel < 0 || channel >= pro::kChannels || !g_pro[channel].connected || status == nullptr || count == 0) {
-@@ -440,6 +641,11 @@ int32_t KPADReadEx(int32_t channel, KPADStatus* status, uint32_t count, be<int32
+-        if (error) *error = kWpadNoController;
++        if (error) *error = -2; // KPAD_ERROR_INVALID_CONTROLLER (port/patch_wiimote_real.py)
+         return 0;
      }
      ProChannel& c = g_pro[channel];
      std::memset(status, 0, sizeof(KPADStatus));
@@ -4885,7 +4957,7 @@ index a861ac3..96fd9a1 100644
      status->extension_type = kExtProController;
      status->pro_hold = c.host.buttons;
      status->pro_trigger = c.host.buttons & ~c.previous;
-@@ -453,9 +659,42 @@ int32_t KPADReadEx(int32_t channel, KPADStatus* status, uint32_t count, be<int32
+@@ -453,9 +672,42 @@ int32_t KPADReadEx(int32_t channel, KPADStatus* status, uint32_t count, be<int32
  int32_t WPADProbe(int32_t channel, be<uint32_t>* type) {
      std::lock_guard lock(g_input_mutex);
      const bool connected = channel >= 0 && channel < pro::kChannels && g_pro[channel].connected;
@@ -4929,7 +5001,36 @@ index a861ac3..96fd9a1 100644
  void WPADRead(int32_t, uint8_t* status) {
      if (status) std::memset(status, 0, 0x2A);
  }
-@@ -504,6 +743,36 @@ void set_pro_pad_state(int channel, const ProPadState& state) {
+@@ -469,6 +721,8 @@ void WPADDisconnect(int32_t channel) {
+     if (channel < 0 || channel >= pro::kChannels) return;
+     std::lock_guard lock(g_input_mutex);
+     ProChannel& c = g_pro[channel];
++    static const bool trace = std::getenv("TTT2_TRACE_WIIMOTE") != nullptr; // port/patch_wiimote_real.py
++    if (trace) std::fprintf(stderr, "wiimote: WPADDisconnect(%d), connected %d\n", channel, c.connected ? 1 : 0);
+     if (!c.connected) return;
+     c.connected = false;
+     c.dropped = true;
+@@ -484,6 +738,7 @@ void WPADClampTrigger(int32_t, uint32_t, uint32_t) {}
+ 
+ void set_gamepad_state(const GamepadState& state) {
+     std::lock_guard lock(g_input_mutex);
++    g_host_input_seen = true; // port/patch_wiimote_real.py
+     g_gamepad = state;
+ }
+ 
+@@ -491,6 +746,11 @@ void set_pro_pad_state(int channel, const ProPadState& state) {
+     if (channel < 0 || channel >= pro::kChannels) return;
+     std::lock_guard lock(g_input_mutex);
+     ProChannel& c = g_pro[channel];
++    if (c.wiimote.connected) { // port/patch_wiimote_real.py: the channel was a Wii Remote
++        c.wiimote = WiimoteState{};
++        if (c.connected) g_pending_connects.push_back({channel, kWpadNoController});
++        c.connected = false;
++    }
+     c.host = state;
+     if (!state.connected) {
+         c.dropped = false;
+@@ -504,6 +764,50 @@ void set_pro_pad_state(int channel, const ProPadState& state) {
      }
  }
  
@@ -4937,7 +5038,16 @@ index a861ac3..96fd9a1 100644
 +bool wiimote_mode() {
 +    static const bool on = [] {
 +        const char* v = std::getenv("CAFE_WIIMOTE");
-+        return v != nullptr && *v != '\0' && *v != '0';
++        return v != nullptr && *v != '\0' && *v != '0' && std::strcmp(v, "real") != 0;
++    }();
++    return on;
++}
++
++// port/patch_wiimote_real.py
++bool wiimote_real_mode() {
++    static const bool on = [] {
++        const char* v = std::getenv("CAFE_WIIMOTE");
++        return v != nullptr && std::strcmp(v, "real") == 0;
 +    }();
 +    return on;
 +}
@@ -4946,6 +5056,11 @@ index a861ac3..96fd9a1 100644
 +    if (channel < 0 || channel >= wiimote::kChannels) return;
 +    std::lock_guard lock(g_input_mutex);
 +    ProChannel& c = g_pro[channel];
++    if (!state.connected && !c.wiimote.connected) return; // port/patch_wiimote_real.py: not a remote's channel
++    if (state.connected && c.connected && !c.wiimote.connected) { // it was a Pro Controller
++        g_pending_connects.push_back({channel, kWpadNoController});
++        c.connected = false;
++    }
 +    const bool was = c.connected;
 +    const bool type_changed = was && c.wiimote.connected && state.connected && c.wiimote.nunchuk != state.nunchuk;
 +    c.wiimote = state;
@@ -4966,7 +5081,7 @@ index a861ac3..96fd9a1 100644
  bool pro_controllers_in_use() {
      std::lock_guard lock(g_input_mutex);
      for (const ProChannel& c : g_pro) {
-@@ -539,6 +808,13 @@ CAFE_EXPORT(padscore, KPADInit, KPADInit);
+@@ -539,6 +843,13 @@ CAFE_EXPORT(padscore, KPADInit, KPADInit);
  CAFE_EXPORT(padscore, KPADShutdown, KPADShutdown);
  CAFE_EXPORT(padscore, KPADSetConnectCallback, KPADSetConnectCallback);
  CAFE_EXPORT(padscore, KPADReadEx, KPADReadEx);
