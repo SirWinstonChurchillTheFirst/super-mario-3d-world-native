@@ -1189,15 +1189,42 @@ AvCodecApi& avcodec_api() {
         AvCodecApi a;
         const char* v = std::getenv("CAFE_H264_DECODE");
         if (v != nullptr && std::strcmp(v, "0") == 0) return a;
-        // libavcodec majors with their libavutil: 61/59 (FFmpeg 7), 60/58 (6), 59/57 (5), 58/56 (4)
-        const int pairs[4][2] = {{61, 59}, {60, 58}, {59, 57}, {58, 56}};
+        // libavcodec majors with their libavutil: 62/60 (FFmpeg 8), 61/59 (7), 60/58 (6), 59/57 (5), 58/56 (4)
+        const int pairs[5][2] = {{62, 60}, {61, 59}, {60, 58}, {59, 57}, {58, 56}};
+#ifdef _WIN32
+        // Windows has no system FFmpeg, so the DLLs are looked for where a build or a user puts them: CAFE_FFMPEG_DIR,
+        // next to the program, its "ffmpeg" folder, the "ffmpeg" folder beside the build folder, then the normal DLL
+        // search (PATH). A folder is loaded by full path so that avcodec finds its own avutil/swresample there.
+        std::vector<std::string> dirs;
+        if (const char* d = std::getenv("CAFE_FFMPEG_DIR"); d != nullptr && *d) dirs.emplace_back(d);
+        {
+            char exe[MAX_PATH] = {};
+            const DWORD n = GetModuleFileNameA(nullptr, exe, sizeof exe);
+            std::string dir(exe, n < sizeof exe ? n : 0);
+            const size_t slash = dir.find_last_of("\\/");
+            if (slash != std::string::npos) {
+                dir.resize(slash);
+                dirs.push_back(dir);
+                dirs.push_back(dir + "\\ffmpeg");
+                dirs.push_back(dir + "\\..\\ffmpeg");
+            }
+        }
+        dirs.emplace_back(); // empty = normal DLL search
+        for (const std::string& dir : dirs)
+#endif
         for (const auto& p : pairs) {
 #ifdef _WIN32
             char codec_name[32], util_name[32];
             std::snprintf(codec_name, sizeof codec_name, "avcodec-%d.dll", p[0]);
             std::snprintf(util_name, sizeof util_name, "avutil-%d.dll", p[1]);
-            HMODULE codec = LoadLibraryA(codec_name);
-            HMODULE util = codec ? LoadLibraryA(util_name) : nullptr;
+            const auto load = [&dir](const char* name) {
+                if (dir.empty()) return LoadLibraryA(name);
+                const std::string full = dir + "\\" + name;
+                if (GetFileAttributesA(full.c_str()) == INVALID_FILE_ATTRIBUTES) return HMODULE{};
+                return LoadLibraryExA(full.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            };
+            HMODULE codec = load(codec_name);
+            HMODULE util = codec ? load(util_name) : nullptr;
             const auto sym = [](HMODULE m, const char* n) { return reinterpret_cast<void*>(GetProcAddress(m, n)); };
 #else
             char codec_name[32], util_name[32];
@@ -1222,11 +1249,20 @@ AvCodecApi& avcodec_api() {
             a.ok = a.find_decoder && a.alloc_context3 && a.open2 && a.send_packet && a.receive_frame && a.flush_buffers &&
                    a.free_context && a.packet_alloc && a.packet_free && a.frame_alloc && a.frame_free;
             if (a.ok) {
+#ifdef _WIN32
+                std::fprintf(stderr, "port: h264: decoding with %s%s%s\n", dir.c_str(), dir.empty() ? "" : "\\", codec_name);
+#else
                 std::fprintf(stderr, "port: h264: decoding with %s\n", codec_name);
+#endif
                 return a;
             }
         }
+#ifdef _WIN32
+        std::fprintf(stderr, "port: h264: no FFmpeg (avcodec-62.dll + avutil-60.dll + swresample-6.dll, or 61/59 ...) next to the "
+                             "program, in its ffmpeg folder or in CAFE_FFMPEG_DIR: movie frames are black (sound plays)\n");
+#else
         std::fprintf(stderr, "port: h264: no libavcodec found: movie frames are black (sound plays)\n");
+#endif
         return a;
     }();
     return api;
@@ -1283,6 +1319,14 @@ void h264_frame_to_nv12(const uint8_t* f, uint8_t* out, uint32_t pitch, uint32_t
         if (!said.exchange(true)) std::fprintf(stderr, "port: h264: decoder gives pixel format %d: colours left out\n", format);
     }
 }
+// The decoder wrote a picture (NV12: luma plane + half-height chroma plane) into the title's frame buffer. Titles
+// use that memory as textures without any flush (on the console the GPU samples the memory itself; Mario Kart 8's
+// movie player cycles through 8 frame buffers), so the renderer is told as for the OS memory routines
+// (port/patch_texture_stores.py). Without it each buffer kept its first picture: the movie looped over 8 stills.
+void h264_frame_written(uint32_t frame, uint32_t width, uint32_t height) {
+    const uint32_t pitch = (width + 255) & ~255u;
+    cafe::gpu::cpu_stored(frame, pitch * height + pitch * (height / 2));
+}
 std::mutex g_h264_mutex;
 std::unordered_map<uint32_t, H264State> g_h264;
 uint32_t g_h264_max_width = 1280, g_h264_max_height = 720;
@@ -1291,6 +1335,13 @@ bool h264_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("CAFE_H264");
         return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+bool h264_trace() {
+    static const bool on = [] {
+        const char* v = std::getenv("CAFE_H264_TRACE");
+        return v != nullptr && std::strcmp(v, "0") != 0;
     }();
     return on;
 }
@@ -1416,6 +1467,7 @@ int32_t h264_memory_requirement(int32_t, int32_t, int32_t max_w, int32_t max_h, 
 int32_t h264_check_mem(uint32_t memory, uint32_t) { return !h264_enabled() ? -1 : memory ? kH264Ok : kH264Param; }
 int32_t h264_init_param(int32_t size, uint32_t memory) {
     if (!h264_enabled()) return -1;
+    if (h264_trace()) std::fprintf(stderr, "h264: h264_init_param mem %08X\n", memory);
     if (memory == 0 || size <= 0) return kH264Param;
     std::lock_guard lock(g_h264_mutex);
     H264State& s = g_h264[memory];
@@ -1464,11 +1516,13 @@ int32_t h264_set_user_memory(uint32_t memory, uint32_t value) {
 }
 int32_t h264_ok_if_known(uint32_t memory) {
     if (!h264_enabled()) return -1;
+    if (h264_trace()) std::fprintf(stderr, "h264: h264_ok_if_known mem %08X\n", memory);
     std::lock_guard lock(g_h264_mutex);
     return h264_state(memory) ? kH264Ok : kH264Param;
 }
 int32_t h264_close(uint32_t memory) {
     if (!h264_enabled()) return -1;
+    if (h264_trace()) std::fprintf(stderr, "h264: h264_close mem %08X\n", memory);
     std::lock_guard lock(g_h264_mutex);
     if (H264State* s = h264_state(memory)) h264_free_codec(*s);
     g_h264.erase(memory);
@@ -1490,6 +1544,13 @@ void h264_set_bitstream(PPCContext& ctx) {
     s->stream = buffer;
     s->stream_length = length;
     s->timestamp = timestamp;
+    if (h264_trace()) {
+        const uint8_t* p = guest<uint8_t>(buffer);
+        std::fprintf(stderr, "h264: bitstream mem %08X buf %08X len %u t %.4f nals", memory, buffer, length, timestamp);
+        for (uint32_t i = 0; i + 3 < length; ++i)
+            if (p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1) std::fprintf(stderr, " %u@%u", p[i + 3] & 31, i);
+        std::fprintf(stderr, "\n");
+    }
     ctx.r[3] = kH264Ok;
 }
 // Fills the result structs for one output picture and calls the title's output function (outside the lock).
@@ -1521,6 +1582,7 @@ void h264_output(PPCContext& ctx, H264State* s, uint32_t frame, uint32_t width, 
         fn = s->output_fn;
         output = s->output;
     }
+    if (h264_trace()) std::fprintf(stderr, "h264: output frame %08X %ux%u t %.4f fn %08X\n", frame, width, height, timestamp, fn);
     if (fn != 0) call_guest(ctx, fn, {output});
 }
 void h264_execute(PPCContext& ctx) {
@@ -1559,6 +1621,7 @@ void h264_execute(PPCContext& ctx) {
         const uint32_t pitch = (s->width + 255) & ~255u;
         std::memset(guest<uint8_t>(frame), 16, static_cast<size_t>(pitch) * s->height);
         std::memset(guest<uint8_t>(frame + pitch * s->height), 128, static_cast<size_t>(pitch) * (s->height / 2));
+        h264_frame_written(frame, s->width, s->height);
         h264_output(ctx, s, frame, s->width, s->height, s->timestamp);
         ctx.r[3] = 0x80 | 100; // "100% of a frame decoded"
         return;
@@ -1573,6 +1636,7 @@ void h264_execute(PPCContext& ctx) {
     s->pending.push_back(s->timestamp);
     std::sort(s->pending.begin(), s->pending.end());
     const int sent = av.send_packet(s->codec, s->packet);
+    if (h264_trace()) std::fprintf(stderr, "h264: execute mem %08X frame %08X size %d sent %d\n", memory, frame, size, sent);
     if (sent < 0) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 3) std::fprintf(stderr, "port: h264: libavcodec refused a packet (%d)\n", sent);
@@ -1582,6 +1646,7 @@ void h264_execute(PPCContext& ctx) {
     while (av.receive_frame(s->codec, s->frame) >= 0) {
         uint32_t w = 0, h = 0;
         h264_frame_to_nv12(static_cast<const uint8_t*>(s->frame), guest<uint8_t>(frame), 0, w, h);
+        h264_frame_written(frame, w, h);
         double t = s->timestamp;
         if (!s->pending.empty()) {
             t = s->pending.front();
@@ -1594,6 +1659,7 @@ void h264_execute(PPCContext& ctx) {
 }
 int32_t h264_end(uint32_t memory) {
     if (!h264_enabled()) return -1;
+    if (h264_trace()) std::fprintf(stderr, "h264: h264_end mem %08X\n", memory);
     std::lock_guard lock(g_h264_mutex);
     H264State* s = h264_state(memory);
     if (s == nullptr) return kH264Param;
@@ -1716,6 +1782,7 @@ void gx2_set_clear_stencil(uint32_t buffer, uint32_t value) {
 }
 // h264 helpers for streams: where the first decode unit starts / how long one is (black-frame decoder above).
 int32_t h264_find_start(uint32_t buffer, uint32_t length, be<uint32_t>* offset) {
+    if (h264_trace()) std::fprintf(stderr, "h264: find_start buf %08X len %u\n", buffer, length);
     if (buffer == 0 || offset == nullptr) return kH264Param;
     const uint8_t* p = guest<uint8_t>(buffer);
     for (uint32_t i = 0; i + 3 < length; ++i) {
@@ -1727,6 +1794,7 @@ int32_t h264_find_start(uint32_t buffer, uint32_t length, be<uint32_t>* offset) 
     return kH264Generic;
 }
 int32_t h264_decunit_length(uint32_t, uint32_t buffer, uint32_t length, uint32_t offset, be<uint32_t>* out) {
+    if (h264_trace()) std::fprintf(stderr, "h264: decunit buf %08X len %u off %u\n", buffer, length, offset);
     if (buffer == 0 || out == nullptr || offset >= length) return kH264Param;
     *out = length - offset;
     return kH264Ok;

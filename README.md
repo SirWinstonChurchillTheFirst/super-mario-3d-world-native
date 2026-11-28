@@ -65,6 +65,26 @@ own `CafeStd.ttf` there to replace it. Saves go to `play/save/`. The system lang
 
 **Getestet / tested (23 Nov 2026):** For this game the Windows setup's translation step was run on the tested dump: it gives the same code as the build that runs on the Batocera console (only the newer recompiler's `dcbf` lines differ); the complete build of this game through the scripts was not run yet. The same scripts were run end to end from an empty folder on 23 November 2026: Lost Levels and Mario Kart 8 on Windows 11, Lost Levels on Ubuntu 26.04 and on a fresh Ubuntu 24.04 (SDL3 built from source there), Mario Party 10 on Windows 11.
 
+## Update 28 November 2026: no more shader hitches, the right light after a time-of-day change
+
+- **Hitches while playing.** The shader cache key held state the translation never reads (texture slots the shader
+  does not sample, raw output/input semantics), so the same shader was translated again and again on the draw thread
+  (a player's log: 8,774 cache entries after 6 minutes). `port/patch_shader_key_canon.py` keys only what the
+  translation reads (`TTT2_SHADER_KEY_CHECK=1` re-translates every hit and compares; `TTT2_SHADER_KEY_FULL=1` = old key).
+  Console (Ryzen 3 4350GE), cave in 1-2: 59.35 -> 59.82 frames/s, slowest 10 s 55.1 -> 58.9; 1-1: 59.07 -> 59.81;
+  about 670 instead of 2,000 shaders in the same run.
+- **Wrong light after the time of day changed** (title demo: glaring white-cyan at night after sunset, dark walls at
+  dusk). The scene is lit from small cube maps the CPU rewrites and flushes with `DCFlushRangeNoSync`, which did
+  nothing here, so the textures were never re-read. It now tells the renderer like `DCFlushRange`
+  (`port/patch_dcflush_nosync.py`). Checked against Cemu on the console.
+- `TTT2_GUEST_DMABUF=1` is now set for this game on the console (`console/game-env`): frames over 25 ms in 170 s of
+  play 31 -> 11. A 27-minute session on the console: 59.89 frames/s, slowest 10 s 59.0, memory flat.
+- The runtime now carries the work done for Mario Kart 8 since 23 November (render-target eviction, texture
+  retention, image pool, submit chunks, sound fixes); with all of it the console still gives 59.8 frames/s here.
+- Known open: the HUD group at the top left in a level (lives, coins, green stars) is pale (about 30 %), Cemu shows it
+  fully; the draws are right, the alpha comes from the game's layout state - cause not found yet.
+- Measuring tools: `patch_frame_hist.py`, `patch_trace_shader_keys.py`.
+
 ## Update 23 November 2026: a real Wii Remote is a Wii Remote
 
 Before, a Wii Remote (Linux kernel driver hid-wiimote) reached the game only through SDL as a "GamePad" with the
